@@ -15,6 +15,7 @@
 #
 
 import gc
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -39,7 +40,7 @@ from vllm.model_executor.model_loader.utils import (
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.device.hardware_profile import get_current_hardware_profile
+from vllm_ascend.model_loader.rfork.compat import get_current_hardware_profile
 from vllm_ascend.model_loader.rfork.config import RForkConfig
 from vllm_ascend.model_loader.rfork.identity import build_compatibility_fingerprint
 from vllm_ascend.model_loader.rfork.session import RForkSession
@@ -64,6 +65,7 @@ class _RForkProcessGlobalModelState:
     static_forward_context: tuple[dict[Any, Any], dict[Any, Any]] | None
     static_all_moe_layers: tuple[list[Any], list[Any]] | None
     rope_cache: dict[Any, Any] | None
+    ascend_moe_layers: list[Any] | None = None
 
 
 def _is_rfork_summary_rank(session: RForkSession) -> bool:
@@ -174,6 +176,15 @@ def _make_fallback_load_config(load_config: LoadConfig) -> LoadConfig:
     return fallback_load_config
 
 
+def _get_ascend_moe_registry() -> list[Any] | None:
+    # Model construction may import the adaptor for the first time. Inspect
+    # already-loaded modules without eagerly initializing the EPLB dependency.
+    module = sys.modules.get("vllm_ascend.eplb.adaptor.vllm_adaptor")
+    adaptor = getattr(module, "VllmEplbAdaptor", None)
+    layers = getattr(adaptor, "_registered_moe_layers", None)
+    return layers if isinstance(layers, list) else None
+
+
 def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProcessGlobalModelState:
     """Snapshot registries that model construction can mutate in the process."""
     static_forward_context: tuple[dict[Any, Any], dict[Any, Any]] | None = None
@@ -199,7 +210,9 @@ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProce
     except Exception as e:  # pragma: no cover - best-effort across vLLM versions
         logger.debug("RFork fallback: skip snapshotting _ROPE_DICT: %s", e)
 
-    return _RForkProcessGlobalModelState(static_forward_context, static_all_moe_layers, rope_cache)
+    ascend_moe_registry = _get_ascend_moe_registry()
+    ascend_moe_layers = list(ascend_moe_registry) if ascend_moe_registry is not None else None
+    return _RForkProcessGlobalModelState(static_forward_context, static_all_moe_layers, rope_cache, ascend_moe_layers)
 
 
 def _reset_process_global_model_state(
@@ -214,6 +227,16 @@ def _reset_process_global_model_state(
     entries that were added by an earlier successful model load.
     """
     stale_module_ids = {id(module) for module in model.modules()} if model is not None else set()
+    # AscendMoERunner registers itself even when dynamic EPLB is disabled.
+    # Leaving those references alive retains expert weights across fallback.
+    # Restore in place because an existing adaptor can share this list; keep
+    # target-model registrations when a draft attempt is discarded.
+    ascend_moe_registry = _get_ascend_moe_registry()
+    if ascend_moe_registry is not None:
+        if snapshot is not None:
+            ascend_moe_registry[:] = snapshot.ascend_moe_layers or []
+        elif stale_module_ids:
+            ascend_moe_registry[:] = [layer for layer in ascend_moe_registry if id(layer) not in stale_module_ids]
     removed_names: set[Any] = set()
     compilation_config = getattr(vllm_config, "compilation_config", None)
     if compilation_config is not None:
@@ -315,7 +338,7 @@ def _is_dynamic_eplb_enabled(vllm_config: VllmConfig) -> bool:
 def _rfork_skip_unquantized_moe_post_load_processing(model: Module):
     """Suppress unquantized MoE post-load processing; dense layers still run theirs."""
 
-    from vllm_ascend.ops.fused_moe.routed_experts import AscendUnquantizedFusedMoEMethod
+    from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 
     restored_methods: list[tuple[Any, object]] = []
     for quant_method in _iter_ascend_moe_quant_methods(model):
@@ -459,7 +482,6 @@ class RForkModelLoader(BaseModelLoader):
         target_device = torch.device(load_device)
 
         with set_default_torch_dtype(model_config.dtype):
-            need_del = False
             model_init_started = False
             model: Module | None = None
             session: RForkSession | None = None
@@ -505,7 +527,6 @@ class RForkModelLoader(BaseModelLoader):
                         model_config=model_config,
                         prefix=prefix,
                     )
-                    need_del = True
                 logger.info(
                     "RFork %s model initialization took %.2f seconds",
                     _rfork_model_kind(session),
@@ -581,7 +602,9 @@ class RForkModelLoader(BaseModelLoader):
                     _rfork_model_kind(session),
                 )
             except Exception as e:
-                logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", e)
+                # A queued/captured LogRecord must not retain the exception's
+                # traceback and the discarded model through its arguments.
+                logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", str(e))
 
             cleanup_result: bool | RForkFallbackCleanupResult = False
             if session is not None:
@@ -599,8 +622,10 @@ class RForkModelLoader(BaseModelLoader):
                     "tensor owners remain retained. Refusing to allocate a second model while old weights are pinned."
                 )
 
-            if need_del and model is not None:
-                del model
+            if model_init_started:
+                # A constructor can register layers and then raise before
+                # assigning model. Collect that partial model as well.
+                model = None
                 gc.collect()
                 torch.npu.empty_cache()
                 for _ in range(3):

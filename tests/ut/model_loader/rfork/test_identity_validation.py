@@ -34,6 +34,7 @@ def _stub(monkeypatch, module_name: str, **attributes):
 
 @pytest.fixture
 def identity_module(monkeypatch):
+    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.compat", "compat.py")
     _stub(monkeypatch, "vllm.config", ModelConfig=object, VllmConfig=object)
     _stub(monkeypatch, "vllm_ascend.ascend_config", get_ascend_config=lambda: SimpleNamespace(weight_nz_mode=None))
     _stub(
