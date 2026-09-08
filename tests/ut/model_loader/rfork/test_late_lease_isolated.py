@@ -3,6 +3,7 @@
 
 import importlib.util
 import sys
+import weakref
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -12,6 +13,77 @@ import pytest
 import torch
 
 from tests.ut.model_loader.rfork.test_lease_release import runtime as runtime
+
+
+@pytest.mark.parametrize("failure", ["seed_miss", "initialize", "layout", "transfer"])
+@pytest.mark.parametrize("preexisting_registry", [False, True])
+def test_fallback_releases_eplb_weights_before_second_model(loader_runtime, monkeypatch, failure, preexisting_registry):
+    r = loader_runtime
+    root = Path(__file__).resolve().parents[4]
+    adaptor_name = "vllm_ascend.eplb.adaptor.vllm_adaptor"
+    monkeypatch.delitem(sys.modules, adaptor_name, raising=False)
+
+    def load(name, path):
+        spec = importlib.util.spec_from_file_location(name, root / path)
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, module)
+        spec.loader.exec_module(module)
+        return module
+
+    load("vllm_ascend.quantization.quant_type", "vllm_ascend/quantization/quant_type.py")
+
+    def get_adaptor():
+        if adaptor_name not in sys.modules:
+            load(adaptor_name, "vllm_ascend/eplb/adaptor/vllm_adaptor.py")
+        return sys.modules[adaptor_name].VllmEplbAdaptor
+
+    existing_target = torch.nn.Linear(4, 4)
+    baseline = [existing_target] if preexisting_registry else []
+    original_registry = None
+    if preexisting_registry:
+        adaptor = get_adaptor()
+        adaptor.register_layer(existing_target)
+        original_registry = adaptor._registered_moe_layers
+    refs = {}
+
+    def initialize(**kwargs):
+        model = torch.nn.Module()
+        model.moe = torch.nn.Linear(4, 4)
+        model.moe.self_reference = model.moe
+        refs["layer"] = weakref.ref(model.moe)
+        refs["weight"] = weakref.ref(model.moe.weight)
+        # This is the real registry used unconditionally by AscendMoERunner.
+        get_adaptor().register_layer(model.moe)
+        if failure == "initialize":
+            raise RuntimeError("partial model construction")
+        return model
+
+    def fallback(**kwargs):
+        registry = get_adaptor()._registered_moe_layers
+        assert registry == baseline
+        if original_registry is not None:
+            assert registry is original_registry
+        assert refs["layer"]() is None, "discarded MoE layer survives into fallback"
+        assert refs["weight"]() is None, "discarded expert weight survives into fallback"
+        get_adaptor().register_layer(r.fallback)
+        return r.fallback
+
+    monkeypatch.setattr(r.module, "initialize_model", initialize)
+    monkeypatch.setattr(r.loader, "_requires_processed_layout_transfer", lambda config: True)
+    monkeypatch.setattr(sys.modules["vllm.model_executor.model_loader"], "get_model", fallback)
+    if failure == "seed_miss":
+        r.session.acquire_seed.side_effect = lambda: False
+    elif failure == "layout":
+
+        def fail_layout(*args):
+            raise RuntimeError("layout")
+
+        monkeypatch.setattr(r.module, "process_weights_after_loading", fail_layout)
+    elif failure == "transfer":
+        # Mock call histories themselves would retain the model argument.
+        monkeypatch.setattr(r.session, "transfer_from_seed", lambda *args: False)
+    assert r.loader.load_model(r.vc, r.config) is r.fallback
+    assert get_adaptor()._registered_moe_layers == baseline + [r.fallback]
 
 
 @pytest.fixture
@@ -52,10 +124,23 @@ def loader_runtime(request, monkeypatch):
             eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None)
         ),
     )
-    stub("vllm_ascend.device.hardware_profile", get_current_hardware_profile=Mock())
-    monkeypatch.setattr(
-        sys.modules["vllm_ascend.model_loader.rfork.identity"], "build_compatibility_fingerprint", Mock(), raising=False
-    )
+    if getattr(request, "param", None) == "legacy_hardware":
+        monkeypatch.setitem(sys.modules, "vllm_ascend.device.hardware_profile", None)
+        stub("vllm_ascend.utils", is_310p=lambda: True)
+    else:
+        stub("vllm_ascend.device.hardware_profile", get_current_hardware_profile=Mock())
+    compat_path = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork/compat.py"
+    compat_name = "vllm_ascend.model_loader.rfork.compat"
+    compat_spec = importlib.util.spec_from_file_location(compat_name, compat_path)
+    compat_module = importlib.util.module_from_spec(compat_spec)
+    monkeypatch.setitem(sys.modules, compat_name, compat_module)
+    compat_spec.loader.exec_module(compat_module)
+    identity_path = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork/identity.py"
+    identity_name = "vllm_ascend.model_loader.rfork.identity"
+    identity_spec = importlib.util.spec_from_file_location(identity_name, identity_path)
+    identity_module = importlib.util.module_from_spec(identity_spec)
+    monkeypatch.setitem(sys.modules, identity_name, identity_module)
+    identity_spec.loader.exec_module(identity_module)
     path = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfork/rfork_loader.py"
     name = "vllm_ascend.model_loader.rfork.rfork_loader"
     spec = importlib.util.spec_from_file_location(name, path)
@@ -67,6 +152,7 @@ def loader_runtime(request, monkeypatch):
         torch, "npu", SimpleNamespace(synchronize=lambda: events.append("sync"), empty_cache=Mock()), raising=False
     )
     monkeypatch.setattr(module, "_rfork_pre_transfer_weight_processing", lambda model: nullcontext())
+    moe_processing = module._rfork_skip_unquantized_moe_post_load_processing
     monkeypatch.setattr(module, "_rfork_skip_unquantized_moe_post_load_processing", lambda model: nullcontext())
     load_config = SimpleNamespace(device=None, model_loader_extra_config={}, load_format="rfork")
     loader = module.RForkModelLoader(load_config)
@@ -113,7 +199,56 @@ def loader_runtime(request, monkeypatch):
         existing=existing,
         model=model,
         fallback=fallback,
+        identity_module=identity_module,
+        moe_processing=moe_processing,
     )
+
+
+@pytest.mark.parametrize("loader_runtime", ["legacy_hardware"], indirect=True)
+def test_loader_and_identity_import_without_hardware_profiles(loader_runtime):
+    r = loader_runtime
+    assert r.loader._requires_processed_layout_transfer(r.config)
+    assert r.identity_module.get_current_hardware_profile().weight_layout_policy.name == "FORCE_NZ"
+    fingerprint = r.module.build_compatibility_fingerprint(
+        r.vc, r.config, model_url="model", model_deploy_strategy_name="strategy"
+    )
+    assert len(fingerprint) == 64
+
+
+@pytest.mark.parametrize("raise_during_processing", [False, True])
+def test_legacy_moe_import_skips_and_restores_only_unquantized_hooks(
+    loader_runtime, monkeypatch, raise_during_processing
+):
+    r = loader_runtime
+
+    class LegacyMethod:
+        def __init__(self):
+            self.process_weights_after_loading = Mock()
+
+    class LegacyRunner:
+        def __init__(self, method):
+            self._quant_method = method
+
+    legacy_module = ModuleType("vllm_ascend.ops.fused_moe.fused_moe")
+    legacy_module.AscendUnquantizedFusedMoEMethod = LegacyMethod
+    legacy_module.AscendMoERunner = LegacyRunner
+    monkeypatch.setitem(sys.modules, legacy_module.__name__, legacy_module)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.ops.fused_moe.routed_experts", None)
+    unquantized = LegacyMethod()
+    original_hook = unquantized.process_weights_after_loading
+    quantized = SimpleNamespace(process_weights_after_loading=Mock())
+    model = SimpleNamespace(
+        modules=lambda: iter([LegacyRunner(unquantized), LegacyRunner(quantized), LegacyRunner(unquantized)])
+    )
+    expected_error = pytest.raises(RuntimeError, match="post-load failed") if raise_during_processing else nullcontext()
+    with expected_error, r.moe_processing(model):
+        unquantized.process_weights_after_loading()
+        quantized.process_weights_after_loading()
+        original_hook.assert_not_called()
+        quantized.process_weights_after_loading.assert_called_once()
+        if raise_during_processing:
+            raise RuntimeError("post-load failed")
+    assert unquantized.process_weights_after_loading is original_hook
 
 
 @pytest.mark.parametrize("processed", [False, True])

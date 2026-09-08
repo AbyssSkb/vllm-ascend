@@ -1092,8 +1092,6 @@ def test_rfork_pre_transfer_weight_processing_unwraps_and_restores_quant_methods
 
 
 def test_rfork_skips_only_unquantized_moe_post_load_processing(monkeypatch):
-    import vllm_ascend.ops.fused_moe.routed_experts as routed_experts_module
-
     import vllm_ascend.ops.fused_moe.fused_moe as fused_moe_module
 
     class _FakeAscendUnquantizedFusedMoEMethod:
@@ -1130,7 +1128,7 @@ def test_rfork_skips_only_unquantized_moe_post_load_processing(monkeypatch):
             )
 
     monkeypatch.setattr(
-        routed_experts_module,
+        fused_moe_module,
         "AscendUnquantizedFusedMoEMethod",
         _FakeAscendUnquantizedFusedMoEMethod,
     )
