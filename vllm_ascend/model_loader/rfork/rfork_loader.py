@@ -26,6 +26,7 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 from torch.nn import Module
+from torch.utils.hooks import RemovableHandle
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.distributed import get_tensor_model_parallel_rank
@@ -66,6 +67,7 @@ class _RForkProcessGlobalModelState:
     static_all_moe_layers: tuple[list[Any], list[Any]] | None
     rope_cache: dict[Any, Any] | None
     ascend_moe_layers: list[Any] | None = None
+    dynamo_bytecode_hook_ids: frozenset[int] = frozenset()
 
 
 def _is_rfork_summary_rank(session: RForkSession) -> bool:
@@ -185,6 +187,45 @@ def _get_ascend_moe_registry() -> list[Any] | None:
     return layers if isinstance(layers, list) else None
 
 
+def _get_dynamo_bytecode_hooks() -> dict[int, Any]:
+    # Do not import Dynamo just to snapshot it. Model construction may load it
+    # for the first time, in which case the pre-attempt hook set is empty.
+    module = sys.modules.get("torch._dynamo.convert_frame")
+    hooks = getattr(module, "_bytecode_hooks", None)
+    return hooks if isinstance(hooks, dict) else {}
+
+
+def _remove_discarded_compilation_hooks(
+    stale_module_ids: set[int], snapshot: _RForkProcessGlobalModelState | None
+) -> None:
+    """Detach vLLM compiler callbacks before collecting a failed model attempt.
+
+    TorchCompileWithNoGuardsWrapper registers a bound bytecode_hook during
+    construction. Dynamo's global registry therefore owns the whole decoder,
+    even before the first forward. GC cannot reclaim it until its handle is
+    removed. Use the pre-attempt IDs to find partially constructed models too,
+    while preserving existing target hooks and unrelated compiler callbacks.
+    """
+    hooks = _get_dynamo_bytecode_hooks()
+    removed_count = 0
+    for hook_id, hook in list(hooks.items()):
+        if snapshot is not None and hook_id in snapshot.dynamo_bytecode_hook_ids:
+            continue
+        owner = getattr(hook, "__self__", None)
+        if not isinstance(owner, Module):
+            continue
+        if snapshot is None and id(owner) not in stale_module_ids:
+            continue
+        handle = getattr(owner, "_bytecode_hook_handle", None)
+        if isinstance(handle, RemovableHandle) and handle.id == hook_id and handle.hooks_dict_ref() is hooks:
+            # This is the same operation as vLLM's wrapper.cleanup(), without
+            # importing version-specific wrapper classes or invoking model code.
+            handle.remove()
+            removed_count += 1
+    if removed_count:
+        logger.info("RFork fallback removed %d discarded model compilation hooks.", removed_count)
+
+
 def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProcessGlobalModelState:
     """Snapshot registries that model construction can mutate in the process."""
     static_forward_context: tuple[dict[Any, Any], dict[Any, Any]] | None = None
@@ -212,7 +253,13 @@ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProce
 
     ascend_moe_registry = _get_ascend_moe_registry()
     ascend_moe_layers = list(ascend_moe_registry) if ascend_moe_registry is not None else None
-    return _RForkProcessGlobalModelState(static_forward_context, static_all_moe_layers, rope_cache, ascend_moe_layers)
+    return _RForkProcessGlobalModelState(
+        static_forward_context,
+        static_all_moe_layers,
+        rope_cache,
+        ascend_moe_layers,
+        frozenset(_get_dynamo_bytecode_hooks()),
+    )
 
 
 def _reset_process_global_model_state(
@@ -227,6 +274,7 @@ def _reset_process_global_model_state(
     entries that were added by an earlier successful model load.
     """
     stale_module_ids = {id(module) for module in model.modules()} if model is not None else set()
+    _remove_discarded_compilation_hooks(stale_module_ids, snapshot)
     # AscendMoERunner registers itself even when dynamic EPLB is disabled.
     # Leaving those references alive retains expert weights across fallback.
     # Restore in place because an existing adaptor can share this list; keep
