@@ -11,8 +11,101 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch._dynamo.convert_frame import _bytecode_hooks, register_bytecode_hook
 
 from tests.ut.model_loader.rfork.test_lease_release import runtime as runtime
+
+
+@pytest.mark.parametrize("failure", ["seed_miss", "initialize", "layout", "transfer", "success"])
+@pytest.mark.parametrize("preexisting_hook", [False, True])
+def test_fallback_releases_compiled_model_before_second_model(loader_runtime, monkeypatch, failure, preexisting_hook):
+    """Use Dynamo's real global hook registry, which strongly owns bound methods."""
+    r = loader_runtime
+    handles = []
+    refs = {}
+
+    class CompiledModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(4))
+            # TorchCompileWithNoGuardsWrapper registers this during __init__,
+            # before any forward/compilation and even inside a partial model.
+            self._bytecode_hook_handle = register_bytecode_hook(self.bytecode_hook)
+            handles.append(self._bytecode_hook_handle)
+
+        def bytecode_hook(self, old_code, new_code):
+            return None
+
+    try:
+        target = CompiledModel() if preexisting_hook else None
+        baseline = dict(_bytecode_hooks)
+
+        def initialize(**kwargs):
+            model = torch.nn.Module()
+            model.decoder = CompiledModel()
+            refs["decoder"] = weakref.ref(model.decoder)
+            refs["weight"] = weakref.ref(model.decoder.weight)
+            refs["hook_id"] = model.decoder._bytecode_hook_handle.id
+            # A callback unrelated to vLLM model ownership must survive rollback.
+            unrelated = register_bytecode_hook(lambda old_code, new_code: None)
+            handles.append(unrelated)
+            refs["unrelated_hook_id"] = unrelated.id
+            if failure == "initialize":
+                raise RuntimeError("outer model constructor failed after decoder initialization")
+            return model
+
+        def fallback(**kwargs):
+            assert refs["hook_id"] not in _bytecode_hooks
+            assert refs["decoder"]() is None, "Dynamo still owns the discarded compiled model"
+            assert refs["weight"]() is None, "discarded compiled weights survive into fallback"
+            assert refs["unrelated_hook_id"] in _bytecode_hooks
+            for hook_id, hook in baseline.items():
+                assert _bytecode_hooks[hook_id] is hook
+            if target is not None:
+                assert target.weight.numel() == 4
+            return r.fallback
+
+        monkeypatch.setattr(r.module, "initialize_model", initialize)
+        monkeypatch.setattr(r.loader, "_requires_processed_layout_transfer", lambda config: True)
+        monkeypatch.setattr(sys.modules["vllm.model_executor.model_loader"], "get_model", fallback)
+        # Mock call histories would themselves retain the model argument.
+        monkeypatch.setattr(r.session, "transfer_from_seed", lambda *args: failure != "transfer")
+        r.session.acquire_seed.side_effect = lambda: failure != "seed_miss"
+        if failure == "layout":
+
+            def fail_layout(*args):
+                raise RuntimeError("layout processing failed")
+
+            monkeypatch.setattr(r.module, "process_weights_after_loading", fail_layout)
+        result = r.loader.load_model(r.vc, r.config)
+        if failure == "success":
+            assert refs["decoder"]() is result.decoder
+            assert _bytecode_hooks[refs["hook_id"]].__self__ is result.decoder
+        else:
+            assert result is r.fallback
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def test_fallback_cleans_hooks_when_dynamo_was_imported_during_initialization(loader_runtime, monkeypatch):
+    r = loader_runtime
+    name = "torch._dynamo.convert_frame"
+    # Snapshot must not force-import Dynamo in configurations that never use it.
+    with monkeypatch.context() as context:
+        context.delitem(sys.modules, name)
+        snapshot = r.module._snapshot_process_global_model_state(r.vc)
+        assert name not in sys.modules
+        assert not snapshot.dynamo_bytecode_hook_ids
+    # An outer constructor can fail after an inner compiled model registered.
+    decoder = torch.nn.Linear(4, 4)
+    handle = register_bytecode_hook(decoder.forward)
+    decoder._bytecode_hook_handle = handle
+    try:
+        r.module._reset_process_global_model_state(r.vc, None, snapshot)
+        assert handle.id not in _bytecode_hooks
+    finally:
+        handle.remove()
 
 
 @pytest.mark.parametrize("failure", ["seed_miss", "initialize", "layout", "transfer"])
