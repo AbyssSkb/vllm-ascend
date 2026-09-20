@@ -129,6 +129,11 @@ class NPUModelRunner(GPUModelRunner):
     # backing allocation. Ascend MRV2 preserves that layout in
     # allocate_kv_cache_main and exposes contiguous backend-specific views.
     supports_standardized_shared_kv_backing = True
+    # Block-outermost main descriptors (QSA/CSA packed layouts) are logical
+    # page-strided views into one physical allocation. The V2 runner
+    # materializes those views without multiplying the backing once per
+    # descriptor/layer, same contract as model_runner_v1.
+    supports_page_strided_shared_kv_backing = True
 
     execute_model_state: ExecuteModelState | None
     max_num_reqs: int

@@ -1,9 +1,11 @@
+import types
+
 import vllm.model_executor.layers.mamba.ops.causal_conv1d as _cc1d
 import vllm.third_party.flash_linear_attention.ops as fla_ops
 import vllm.third_party.flash_linear_attention.ops.fused_recurrent as fla_fused_recurrent
 import vllm.third_party.flash_linear_attention.ops.layernorm_guard as fla_layernorm_guard
 from vllm.logger import logger
-from vllm.triton_utils import HAS_TRITON, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.math_utils import next_power_of_2
 
 from vllm_ascend.ops.causal_conv1d import (
@@ -12,6 +14,27 @@ from vllm_ascend.ops.causal_conv1d import (
 from vllm_ascend.ops.causal_conv1d import causal_conv1d_update as _npu_causal_conv1d_update_impl
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.layernorm_guard import LayerNormFn
+
+# Upstream Triton kernels increasingly carry optional CUDA PDL hooks guarded by
+# a ``launch_pdl`` constexpr. Ascend always passes False, but Triton's dependency
+# finder still resolves ``tl.extra.cuda`` before constant folding and otherwise
+# fails while hashing the kernel. Supply no-op JIT symbols only when the backend
+# does not expose that namespace; the guarded calls are compiled out on Ascend.
+if HAS_TRITON:
+
+    @triton.jit
+    def _gdc_wait_noop():
+        pass
+
+    @triton.jit
+    def _gdc_launch_dependents_noop():
+        pass
+
+    if not hasattr(tl.extra, "cuda"):
+        tl.extra.cuda = types.SimpleNamespace(
+            gdc_wait=_gdc_wait_noop,
+            gdc_launch_dependents=_gdc_launch_dependents_noop,
+        )
 
 triton.next_power_of_2 = next_power_of_2
 
