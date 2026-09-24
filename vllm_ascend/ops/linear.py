@@ -96,6 +96,12 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
             # shared_expert_gate in ND format, leaving non-310P policy intact.
             if not keep_nd_weight:
                 layer.weight.data = maybe_trans_nz(layer.weight.data)
+        # Dummy loading skips weight_loader, so reshape wo_a in the shared
+        # post-load path before RFork records the model's tensor layout.
+        if "wo_a" in layer.prefix and get_ascend_device_type() != AscendDeviceType.A5 and layer.weight.ndim == 2:
+            layer.weight.data = (
+                layer.weight.data.view(layer.n_local_groups, layer.o_lora_rank, -1).transpose(2, 1).contiguous()
+            )
 
     def apply(
         self,
@@ -480,9 +486,6 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         if "wo_a" in self.prefix and get_ascend_device_type() != AscendDeviceType.A5:
             if self.weight.ndim == 2:
                 super().weight_loader(param, loaded_weight)
-                self.weight.data = (
-                    self.weight.data.view(self.n_local_groups, self.o_lora_rank, -1).transpose(2, 1).contiguous()
-                )
             else:
                 # In RL update flows, wo_a can be loaded again after being
                 # transformed into [n_local_groups, hidden_size, o_lora_rank].

@@ -13,6 +13,7 @@ from vllm_ascend.ops.linear import (
     AscendRowParallelLinear,
     AscendUnquantizedLinearMethod,
 )
+from vllm_ascend.utils import AscendDeviceType
 
 
 class BaseLinearTest(unittest.TestCase):
@@ -59,6 +60,20 @@ class TestAscendUnquantizedLinearMethod(TestBase):
         mock_is_meta = mock.PropertyMock(return_value=False)
         type(self.layer.weight.data).is_meta = mock_is_meta
         self.layer.precast_fp32_weight = False
+
+    @patch("vllm_ascend.ops.linear.get_ascend_device_type", return_value=AscendDeviceType.A3)
+    @patch("vllm_ascend.ops.linear.maybe_trans_nz", side_effect=lambda weight: weight)
+    def test_dummy_wo_a_reshape_matches_loaded_layout(self, _mock_trans_nz, _mock_device_type):
+        self.layer.prefix = "model.layers.0.mlp.wo_a"
+        self.layer.n_local_groups = 2
+        self.layer.o_lora_rank = 2
+        self.layer.weight = torch.nn.Parameter(torch.arange(24, dtype=torch.bfloat16).reshape(4, 6))
+
+        with patch("vllm_ascend.ops.linear.UnquantizedLinearMethod.process_weights_after_loading"):
+            self.method.process_weights_after_loading(self.layer)
+            self.assertEqual(tuple(self.layer.weight.data.shape), (2, 6, 2))
+            self.method.process_weights_after_loading(self.layer)
+            self.assertEqual(tuple(self.layer.weight.data.shape), (2, 6, 2))
 
     @patch("vllm_ascend.utils.get_ascend_config")
     @mock.patch("torch_npu.npu_format_cast")
