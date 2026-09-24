@@ -6,6 +6,7 @@ import torch
 
 from tests.ut.base import TestBase
 from vllm_ascend import ascend_config
+from vllm_ascend.device.hardware_profile import WeightLayoutPolicy
 from vllm_ascend.distributed import parallel_state
 from vllm_ascend.ops.linear import (
     AscendMergedColumnParallelLinear,
@@ -59,6 +60,34 @@ class TestAscendUnquantizedLinearMethod(TestBase):
         mock_is_meta = mock.PropertyMock(return_value=False)
         type(self.layer.weight.data).is_meta = mock_is_meta
         self.layer.precast_fp32_weight = False
+
+    @patch("vllm_ascend.ops.linear.get_current_hardware_profile")
+    @patch("vllm_ascend.ops.linear.maybe_trans_nz", side_effect=lambda weight: weight)
+    def test_dummy_wo_a_reshape_matches_loaded_layout(self, _mock_trans_nz, mock_profile):
+        cases = [
+            (False, WeightLayoutPolicy.CONFIGURABLE, torch.bfloat16, None, True),
+            (False, WeightLayoutPolicy.FORCE_NZ, torch.float16, None, True),
+            (True, WeightLayoutPolicy.CONFIGURABLE, torch.bfloat16, None, True),
+            (True, WeightLayoutPolicy.CONFIGURABLE, torch.float16, None, False),
+            (True, WeightLayoutPolicy.CONFIGURABLE, torch.bfloat16, object(), False),
+        ]
+        for dynamic_mx_quant_fusion, layout_policy, dtype, quant_config, reshape in cases:
+            with self.subTest(dynamic_mx_quant_fusion=dynamic_mx_quant_fusion, dtype=dtype, quant_config=quant_config):
+                mock_profile.return_value.supports.return_value = dynamic_mx_quant_fusion
+                mock_profile.return_value.weight_layout_policy = layout_policy
+                self.layer.prefix = "model.layers.0.mlp.wo_a"
+                self.layer.n_local_groups = 2
+                self.layer.o_lora_rank = 2
+                self.layer.quant_config = quant_config
+                checkpoint = torch.arange(24, dtype=dtype).reshape(4, 6)
+                self.layer.weight = torch.nn.Parameter(checkpoint.clone())
+                expected = checkpoint.reshape(2, 2, 6).transpose(2, 1).contiguous() if reshape else checkpoint
+
+                with patch("vllm_ascend.ops.linear.UnquantizedLinearMethod.process_weights_after_loading"):
+                    self.method.process_weights_after_loading(self.layer)
+                    torch.testing.assert_close(self.layer.weight.data, expected)
+                    self.method.process_weights_after_loading(self.layer)
+                    torch.testing.assert_close(self.layer.weight.data, expected)
 
     @patch("vllm_ascend.utils.get_ascend_config")
     @mock.patch("torch_npu.npu_format_cast")
