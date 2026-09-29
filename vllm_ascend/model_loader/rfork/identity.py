@@ -25,6 +25,7 @@ from typing import Any
 import torch
 from vllm.config import ModelConfig, VllmConfig
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.model_loader.rfork.compat import get_current_hardware_profile
 
@@ -283,5 +284,6 @@ def build_seed_key(
         # Keep this wire-format key for compatibility with existing seed keys.
         "is_draft_worker": bool(is_draft_model),
     }
-    canonical_descriptor = json.dumps(descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(canonical_descriptor.encode("utf-8")).hexdigest()
+    hash_seed_key = envs.VLLM_ASCEND_RFORK_HASH_SEED_KEY
+    canonical_descriptor = json.dumps(descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=not hash_seed_key)
+    return hashlib.sha256(canonical_descriptor.encode("utf-8")).hexdigest() if hash_seed_key else canonical_descriptor

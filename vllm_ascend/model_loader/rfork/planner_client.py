@@ -59,6 +59,7 @@ class RForkPlannerClient:
             pp_rank=identity.pp_rank,
             ep_rank=identity.ep_rank,
         )
+        logger.info("RFork seed key initialized: tp_rank=%s, seed_key=%s", identity.tp_rank, self.seed_key)
 
     def _require_planner(self) -> None:
         if not self.planner_url:

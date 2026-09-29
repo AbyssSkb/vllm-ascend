@@ -249,7 +249,7 @@ layout mode, and hardware layout policy. This prevents an old or differently
 configured seed from being selected merely because its textual key happens to
 match.
 
-Two instances must agree on model identity and parallel layout before the planner will treat them as interchangeable seeds. The seed key is an opaque SHA256 digest, so seed and receiver instances must run the same RFork protocol to derive the same key.
+Two instances must agree on model identity and parallel layout before the planner will treat them as interchangeable seeds. By default, the seed key is an opaque SHA256 digest. Set `VLLM_ASCEND_RFORK_HASH_SEED_KEY=0` on both seed and receiver instances to send the same descriptor as ASCII JSON in the `SEED_KEY` header so the planner can inspect it. The compatibility fingerprint remains hashed. Instances intended to share seeds must use the same setting, and JSON keys expose model identifiers in HTTP headers and logs.
 
 ### Planner Responsibilities
 

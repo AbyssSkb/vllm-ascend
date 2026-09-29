@@ -40,6 +40,7 @@ from vllm.model_executor.model_loader.utils import (
 )
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.model_loader.rfork.compat import get_current_hardware_profile
 from vllm_ascend.model_loader.rfork.config import RForkConfig
@@ -466,7 +467,7 @@ class RForkModelLoader(BaseModelLoader):
             if tp_rank == 0:
                 logger.info(
                     "RFork %s session group initialized: model=%s, strategy=%s, planner=%s, "
-                    "pp_rank=%s, ep_rank=%s, fingerprint=%s",
+                    "pp_rank=%s, ep_rank=%s, fingerprint=%s, hash_seed_key=%s",
                     "draft" if is_draft_model else "main",
                     self.rfork_config.model_url,
                     self.rfork_config.model_deploy_strategy_name,
@@ -474,6 +475,7 @@ class RForkModelLoader(BaseModelLoader):
                     pp_rank,
                     ep_rank,
                     compatibility_fingerprint,
+                    str(envs.VLLM_ASCEND_RFORK_HASH_SEED_KEY).lower(),
                 )
             else:
                 logger.debug(

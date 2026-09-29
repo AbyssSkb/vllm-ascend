@@ -2,6 +2,8 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import importlib.util
+import hashlib
+import json
 import logging
 import sys
 from dataclasses import dataclass
@@ -204,6 +206,37 @@ def test_build_seed_key_rejects_missing_identity_values(identity_module):
         build(0, "model", "strategy", "")
     with pytest.raises(TypeError):
         build(0, "model", "strategy")
+
+
+def test_build_seed_key_hash_toggle(identity_module, monkeypatch):
+    kwargs = dict(
+        tp_rank=1,
+        pp_rank=2,
+        ep_rank=3,
+        model_url="模型",
+        model_deploy_strategy_name="strategy",
+        compatibility_fingerprint="fingerprint",
+        is_draft_model=True,
+    )
+    descriptor = {
+        "compatibility_fingerprint": "fingerprint",
+        "model_url": "模型",
+        "model_deploy_strategy_name": "strategy",
+        "tp_rank": 1,
+        "pp_rank": 2,
+        "ep_rank": 3,
+        "is_draft_worker": True,
+    }
+    monkeypatch.delenv("VLLM_ASCEND_RFORK_HASH_SEED_KEY", raising=False)
+    expected_hash = hashlib.sha256(
+        json.dumps(descriptor, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    assert identity_module.build_seed_key(**kwargs) == expected_hash
+
+    monkeypatch.setenv("VLLM_ASCEND_RFORK_HASH_SEED_KEY", "0")
+    seed_key = identity_module.build_seed_key(**kwargs)
+    assert seed_key.isascii()
+    assert json.loads(seed_key) == descriptor
 
 
 def test_manifest_rejects_conflicting_mapping_and_tuple_dtype(manifest_module):
