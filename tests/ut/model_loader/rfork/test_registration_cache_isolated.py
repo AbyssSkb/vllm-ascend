@@ -150,3 +150,92 @@ def test_post_load_layout_diagnostic_failure_does_not_escape(tensor_runtime, mon
         backend.log_model_layout_summary(object(), False, stage="receiver_after_post_load")
 
     assert "unavailable=RuntimeError:inspection failed" in caplog.text
+
+
+@pytest.mark.parametrize("processed_layout", [False, True])
+def test_attribute_graph_expands_shared_metadata_once(tensor_runtime, monkeypatch, processed_layout):
+    class CountingDict(dict):
+        scans = 0
+
+        def items(self):
+            self.scans += 1
+            return super().items()
+
+    metadata = CountingDict(value=1)
+    nodes = [metadata]
+    for _ in range(12):
+        metadata = CountingDict(left=metadata, right=metadata)
+        nodes.append(metadata)
+    model = torch.nn.Module()
+    for index in range(8):
+        layer = torch.nn.Module()
+        layer.impl = SimpleNamespace(config=metadata, weight=torch.ones(2))
+        model.add_module(f"layer_{index}", layer)
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_transferable_tensor", lambda _tensor: True)
+
+    collected = tensor_runtime.tensor_layout.collect_transferable_tensors(model, processed_layout)
+
+    assert [name for name, _ in collected] == [f"layer_{index}.impl.weight" for index in range(8)]
+    assert all(node.scans == 1 for node in nodes)
+
+
+def test_attribute_graph_keeps_object_scan_modes_separate(tensor_runtime, monkeypatch):
+    model = torch.nn.Module()
+    shared = [SimpleNamespace(weight=torch.ones(2))]
+    model.metadata = shared
+    model.impl = shared
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_transferable_tensor", lambda _tensor: True)
+
+    collected = tensor_runtime.tensor_layout.collect_transferable_tensors(model, True)
+
+    assert [name for name, _ in collected] == ["impl.0.weight"]
+
+
+def test_attribute_graph_keeps_conflicting_alias_name_checks(tensor_runtime, monkeypatch):
+    model = torch.nn.Module()
+    shared = {"weight": torch.ones(2)}
+    model.impl = {"first": shared, "second": shared, "second.weight": torch.ones(3)}
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_transferable_tensor", lambda _tensor: True)
+
+    with pytest.raises(ValueError, match="conflicting tensor entries"):
+        tensor_runtime.tensor_layout.collect_transferable_tensors(model, True)
+
+
+def test_attribute_graph_marks_tensor_paths_through_cycles(tensor_runtime):
+    first = {}
+    second = {"first": first}
+    first.update(second=second, weight=torch.ones(2))
+    roots, children, tensors = tensor_runtime.tensor_layout._build_tensor_attribute_graph(
+        [("impl", {"first": first, "second": second}, True)]
+    )
+
+    paths = [
+        name
+        for prefix, key in roots
+        for name, _ in tensor_runtime.tensor_layout._iter_tensors_in_graph(prefix, key, children, tensors, set())
+    ]
+
+    assert paths == ["impl.first.weight", "impl.second.first.weight"]
+
+
+def test_attribute_graph_filters_runtime_tensor_names_per_path(tensor_runtime, monkeypatch):
+    model = torch.nn.Module()
+    weight = torch.ones(2)
+    model.impl = {"topk_indices_buffer": weight, "weight": weight}
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_transferable_tensor", lambda _tensor: True)
+
+    collected = tensor_runtime.tensor_layout.collect_transferable_tensors(model, True)
+
+    assert [name for name, _ in collected] == ["impl.weight"]
+
+
+def test_attribute_graph_is_rebuilt_for_each_collection(tensor_runtime, monkeypatch):
+    model = torch.nn.Module()
+    model.impl = {}
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_transferable_tensor", lambda _tensor: True)
+    assert tensor_runtime.tensor_layout.collect_transferable_tensors(model, True) == []
+    model.impl["weight"] = torch.ones(2)
+
+    collected = tensor_runtime.tensor_layout.collect_transferable_tensors(model, True)
+
+    assert [name for name, _ in collected] == ["impl.weight"]

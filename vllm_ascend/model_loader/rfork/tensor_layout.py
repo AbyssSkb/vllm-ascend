@@ -9,6 +9,7 @@ import hashlib
 import inspect
 import json
 import logging
+from collections import deque
 from collections.abc import Iterable, Iterator
 from typing import Any
 
@@ -251,61 +252,95 @@ def validate_transferable_tensor_layout(name: str, tensor: torch.Tensor) -> None
     )
 
 
-def _iter_tensors_in_value(
+def _build_tensor_attribute_graph(
+    roots: list[tuple[str, Any, bool]],
+) -> tuple[
+    list[tuple[str, tuple[int, bool]]],
+    dict[tuple[int, bool], list[tuple[str, tuple[int, bool]]]],
+    dict[tuple[int, bool], torch.Tensor],
+]:
+    """Expand each object/mode once, then retain only paths that can reach tensors."""
+    # Hold strong references during the build so object identities cannot be reused.
+    objects: dict[tuple[int, bool], Any] = {}
+    children: dict[tuple[int, bool], list[tuple[str, tuple[int, bool]]]] = {}
+    parents: dict[tuple[int, bool], list[tuple[int, bool]]] = {}
+    tensors: dict[tuple[int, bool], torch.Tensor] = {}
+    pending: deque[tuple[int, bool]] = deque()
+
+    def add(value: Any, scan_objects: bool) -> tuple[int, bool] | None:
+        key = (id(value), scan_objects)
+        if isinstance(value, torch.Tensor):
+            tensors[key] = value
+            return key
+        if isinstance(value, (nn.Module, str, bytes)):
+            return None
+        if inspect.isfunction(value) or inspect.ismethod(value) or inspect.isclass(value):
+            return None
+        if not isinstance(value, (list, tuple, dict)) and (not scan_objects or not hasattr(value, "__dict__")):
+            return None
+        if key not in objects:
+            objects[key] = value
+            pending.append(key)
+        return key
+
+    indexed_roots = []
+    for name, value, scan_objects in roots:
+        key = add(value, scan_objects)
+        if key is not None:
+            indexed_roots.append((name, key))
+    while pending:
+        key = pending.popleft()
+        value = objects[key]
+        scan_objects = key[1]
+        if isinstance(value, (list, tuple)):
+            items = enumerate(value)
+        elif isinstance(value, dict):
+            items = value.items()
+        else:
+            items = ((name, item) for name, item in vars(value).items() if not name.startswith("_"))
+        edges = []
+        for name, item in items:
+            child = add(item, scan_objects)
+            if child is not None:
+                edges.append((f"{name}", child))
+                parents.setdefault(child, []).append(key)
+        children[key] = edges
+    reachable = set(tensors)
+    pending.extend(tensors)
+    while pending:
+        for parent in parents.get(pending.popleft(), ()):
+            if parent not in reachable:
+                reachable.add(parent)
+                pending.append(parent)
+    children = {
+        key: [(name, child) for name, child in edges if child in reachable]
+        for key, edges in children.items()
+        if key in reachable
+    }
+    indexed_roots = [(name, key) for name, key in indexed_roots if key in reachable]
+    return indexed_roots, children, tensors
+
+
+def _iter_tensors_in_graph(
     prefix: str,
-    value: Any,
+    key: tuple[int, bool],
+    children: dict[tuple[int, bool], list[tuple[str, tuple[int, bool]]]],
+    tensors: dict[tuple[int, bool], torch.Tensor],
     visited_object_ids: set[int],
-    scan_objects: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    if isinstance(value, torch.Tensor):
-        yield prefix, value
+    # Keep alias paths for name-conflict checks and runtime-only filtering.
+    if key in tensors:
+        tensor = tensors[key]
+        yield prefix, tensor
         return
-    if isinstance(value, (nn.Module, str, bytes)):
+    if key[0] in visited_object_ids:
         return
-    # Scan callable instances for tensors, but skip executable function, method, and class objects.
-    if inspect.isfunction(value) or inspect.ismethod(value) or inspect.isclass(value):
-        return
-    if isinstance(value, (list, tuple)):
-        value_id = id(value)
-        if value_id in visited_object_ids:
-            return
-        visited_object_ids.add(value_id)
-        try:
-            for index, item in enumerate(value):
-                yield from _iter_tensors_in_value(f"{prefix}.{index}", item, visited_object_ids, scan_objects)
-        finally:
-            visited_object_ids.remove(value_id)
-        return
-    if isinstance(value, dict):
-        value_id = id(value)
-        if value_id in visited_object_ids:
-            return
-        visited_object_ids.add(value_id)
-        try:
-            for key, item in value.items():
-                yield from _iter_tensors_in_value(f"{prefix}.{key}", item, visited_object_ids, scan_objects)
-        finally:
-            visited_object_ids.remove(value_id)
-        return
-    if callable(value) and (not scan_objects or not hasattr(value, "__dict__")):
-        return
-    if not scan_objects or not hasattr(value, "__dict__"):
-        return
-    value_id = id(value)
-    if value_id in visited_object_ids:
-        return
-    visited_object_ids.add(value_id)
+    visited_object_ids.add(key[0])
     try:
-        for attr_name, attr_value in vars(value).items():
-            if not attr_name.startswith("_"):
-                yield from _iter_tensors_in_value(
-                    f"{prefix}.{attr_name}",
-                    attr_value,
-                    visited_object_ids,
-                    scan_objects,
-                )
+        for name, child in children[key]:
+            yield from _iter_tensors_in_graph(f"{prefix}.{name}", child, children, tensors, visited_object_ids)
     finally:
-        visited_object_ids.remove(value_id)
+        visited_object_ids.remove(key[0])
 
 
 def _try_collect(
@@ -365,6 +400,7 @@ def collect_transferable_tensors(model: nn.Module, processed_layout: bool) -> li
         _try_collect(name, tensor, seen, seen_tensors, collected)
     for name, tensor in model.named_buffers():
         _try_collect(name, tensor, seen, seen_tensors, collected)
+    roots: list[tuple[str, Any, bool]] = []
     for module_prefix, module in model.named_modules():
         attributes: Iterable[tuple[str, Any, bool]]
         if processed_layout:
@@ -378,14 +414,13 @@ def collect_transferable_tensors(model: nn.Module, processed_layout: bool) -> li
             attributes = () if impl is None or isinstance(impl, nn.Module) else (("impl", impl, True),)
 
         for attr_name, attr_value, scan_objects in attributes:
-            for tensor_name, tensor in _iter_tensors_in_value(
-                attr_name,
-                attr_value,
-                set(),
-                scan_objects,
-            ):
-                full_name = f"{module_prefix}.{tensor_name}" if module_prefix else tensor_name
-                _try_collect(full_name, tensor, seen, seen_tensors, collected)
+            attr_path = f"{module_prefix}.{attr_name}" if module_prefix else attr_name
+            roots.append((attr_path, attr_value, scan_objects))
+
+    indexed_roots, children, tensors = _build_tensor_attribute_graph(roots)
+    for attr_path, key in indexed_roots:
+        for tensor_name, tensor in _iter_tensors_in_graph(attr_path, key, children, tensors, set()):
+            _try_collect(tensor_name, tensor, seen, seen_tensors, collected)
     return collected
 
 
