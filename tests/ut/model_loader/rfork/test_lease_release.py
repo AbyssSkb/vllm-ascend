@@ -225,6 +225,7 @@ def test_shutdown_retains_resources_for_an_unresolved_lease(runtime, caplog):
 def test_register_destination_binds_structural_digest(runtime, monkeypatch):
     backend = Mock()
     backend.register_memory_region.return_value = True
+    backend.snapshot_registered_tensor_inventory.return_value = []
     monkeypatch.setattr(runtime.session, "RForkTransferBackend", Mock(return_value=backend))
     session = runtime.session.RForkSession(runtime.config, runtime.identity)
 
@@ -236,6 +237,7 @@ def test_register_destination_binds_structural_digest(runtime, monkeypatch):
 def test_seed_service_refuses_advertisement_after_digest_drift(runtime, monkeypatch, caplog):
     backend = Mock()
     backend.register_memory_region.return_value = True
+    backend.snapshot_registered_tensor_inventory.return_value = []
     backend.unregister_memory_region.return_value = True
     monkeypatch.setattr(runtime.session, "RForkTransferBackend", Mock(return_value=backend))
     digests = iter(["digest-a", "digest-b"])
