@@ -9,8 +9,7 @@ import hashlib
 import inspect
 import json
 import logging
-from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 from typing import Any
 
 import torch
@@ -252,175 +251,126 @@ def validate_transferable_tensor_layout(name: str, tensor: torch.Tensor) -> None
     )
 
 
-def _build_tensor_attribute_graph(
-    roots: list[tuple[str, Any, bool]],
-) -> tuple[
-    list[tuple[str, tuple[int, bool]]],
-    dict[tuple[int, bool], list[tuple[str, tuple[int, bool]]]],
-    dict[tuple[int, bool], torch.Tensor],
-]:
-    """Expand each object/mode once, then retain only paths that can reach tensors."""
-    # Hold strong references during the build so object identities cannot be reused.
-    objects: dict[tuple[int, bool], Any] = {}
-    children: dict[tuple[int, bool], list[tuple[str, tuple[int, bool]]]] = {}
-    parents: dict[tuple[int, bool], list[tuple[int, bool]]] = {}
-    tensors: dict[tuple[int, bool], torch.Tensor] = {}
-    pending: deque[tuple[int, bool]] = deque()
+def _tensor_edge_id(parent_id: bytes, kind: str, name: Any) -> bytes:
+    # Typed, framed labels distinguish e.g. dict keys 1 / "1" and "a.b" / a -> b.
+    name_type = type(name)
+    label = json.dumps(
+        (kind, name_type.__module__, name_type.__qualname__, name),
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode()
+    return hashlib.sha256(parent_id + label).digest()
 
-    def add(value: Any, scan_objects: bool) -> tuple[int, bool] | None:
-        key = (id(value), scan_objects)
-        if isinstance(value, torch.Tensor):
-            tensors[key] = value
-            return key
-        if isinstance(value, (nn.Module, str, bytes)):
-            return None
-        if inspect.isfunction(value) or inspect.ismethod(value) or inspect.isclass(value):
-            return None
-        if not isinstance(value, (list, tuple, dict)) and (not scan_objects or not hasattr(value, "__dict__")):
-            return None
-        if key not in objects:
-            objects[key] = value
-            pending.append(key)
-        return key
 
-    indexed_roots = []
-    for name, value, scan_objects in roots:
-        key = add(value, scan_objects)
-        if key is not None:
-            indexed_roots.append((name, key))
-    while pending:
-        key = pending.popleft()
-        value = objects[key]
-        scan_objects = key[1]
-        if isinstance(value, (list, tuple)):
-            items = enumerate(value)
-        elif isinstance(value, dict):
-            items = value.items()
+def _iter_tensor_children(
+    value: Any, scan_objects: bool, processed_layout: bool
+) -> Iterator[tuple[str, Any, Any, bool]]:
+    if isinstance(value, nn.Module):
+        # Read local registries: named_parameters/named_modules discard aliases before we can canonicalize them.
+        for kind, members in (("module", value._modules), ("parameter", value._parameters), ("buffer", value._buffers)):
+            for name, item in members.items():
+                yield kind, name, item, False
+        if processed_layout:
+            for name, item in vars(value).items():
+                if not name.startswith("_"):
+                    yield "attribute", name, item, name == "impl"
         else:
-            items = ((name, item) for name, item in vars(value).items() if not name.startswith("_"))
-        edges = []
-        for name, item in items:
-            child = add(item, scan_objects)
-            if child is not None:
-                edges.append((f"{name}", child))
-                parents.setdefault(child, []).append(key)
-        children[key] = edges
-    reachable = set(tensors)
-    pending.extend(tensors)
-    while pending:
-        for parent in parents.get(pending.popleft(), ()):
-            if parent not in reachable:
-                reachable.add(parent)
-                pending.append(parent)
-    children = {
-        key: [(name, child) for name, child in edges if child in reachable]
-        for key, edges in children.items()
-        if key in reachable
-    }
-    indexed_roots = [(name, key) for name, key in indexed_roots if key in reachable]
-    return indexed_roots, children, tensors
+            yield "attribute", "impl", getattr(value, "impl", None), True
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            yield "index", index, item, scan_objects
+    elif isinstance(value, dict):
+        for name, item in value.items():
+            yield "key", name, item, scan_objects
+    else:
+        for name, item in vars(value).items():
+            if not name.startswith("_"):
+                yield "attribute", name, item, scan_objects
 
 
-def _iter_tensors_in_graph(
-    prefix: str,
-    key: tuple[int, bool],
-    children: dict[tuple[int, bool], list[tuple[str, tuple[int, bool]]]],
-    tensors: dict[tuple[int, bool], torch.Tensor],
-    visited_object_ids: set[int],
-) -> Iterator[tuple[str, torch.Tensor]]:
-    # Keep alias paths for name-conflict checks and runtime-only filtering.
-    if key in tensors:
-        tensor = tensors[key]
-        yield prefix, tensor
-        return
-    if key[0] in visited_object_ids:
-        return
-    visited_object_ids.add(key[0])
-    try:
-        for name, child in children[key]:
-            yield from _iter_tensors_in_graph(f"{prefix}.{name}", child, children, tensors, visited_object_ids)
-    finally:
-        visited_object_ids.remove(key[0])
-
-
-def _try_collect(
-    name: str,
-    tensor: torch.Tensor,
-    seen_names: dict[str, int],
-    seen_tensors: dict[tuple[Any, ...], int],
-    collected: list[tuple[str, torch.Tensor]],
-) -> None:
-    if _is_runtime_only_tensor(name) or not is_transferable_tensor(tensor):
-        return
-    validate_transferable_tensor_layout(name, tensor)
-    data_ptr = tensor.data_ptr()
-    tensor_signature = (
-        data_ptr,
-        tensor.numel(),
-        tuple(tensor.shape),
-        tensor.dtype,
-        tensor.device,
-        tuple(tensor.stride()),
-    )
-    existing_index = seen_names.get(name)
-    if existing_index is not None:
-        existing_tensor = collected[existing_index][1]
-        if existing_tensor is tensor or tensor_signature == (
-            existing_tensor.data_ptr(),
-            existing_tensor.numel(),
-            tuple(existing_tensor.shape),
-            existing_tensor.dtype,
-            existing_tensor.device,
-            tuple(existing_tensor.stride()),
-        ):
-            return
-        raise ValueError(
-            "RFork encountered conflicting tensor entries for logical name "
-            f"{name!r}; shape, dtype, stride, or storage differs."
-        )
-
-    # Parameters and buffers are canonical. An implementation object may expose
-    # the exact same tensor under another public name; transferring that range
-    # twice only bloats the manifest. Distinct views retain separate entries.
-    existing_index = seen_tensors.get(tensor_signature)
-    if existing_index is not None:
-        seen_names[name] = existing_index
-        return
-
-    seen_names[name] = len(collected)
-    seen_tensors[tensor_signature] = len(collected)
-    collected.append((name, tensor))
+def _tensor_child_key(
+    kind: str,
+    name: Any,
+    value: Any,
+    scan_objects: bool,
+    tensor_metadata: dict[int, tuple[torch.Tensor, tuple[Any, ...] | None]],
+) -> tuple[Any, ...] | None:
+    """Filter a candidate edge and return its local tensor-range or object key."""
+    if isinstance(value, torch.Tensor):
+        # Reject this alias edge only; another alias may still collect the tensor.
+        if _is_runtime_only_tensor(f"{name}"):
+            return None
+        metadata = tensor_metadata.get(id(value))
+        if metadata is not None:
+            return metadata[1]
+        signature = None
+        if is_transferable_tensor(value):
+            validate_transferable_tensor_layout(f"{name}", value)
+            signature = (
+                value.data_ptr(),
+                value.numel(),
+                tuple(value.shape),
+                value.dtype,
+                value.device,
+                tuple(value.stride()),
+            )
+        tensor_metadata[id(value)] = (value, signature)
+        return signature
+    if isinstance(value, nn.Module):
+        # Follow modules only through their registration edges.
+        return (id(value), False) if kind == "module" else None
+    if isinstance(value, (str, bytes)):
+        return None
+    if inspect.isfunction(value) or inspect.ismethod(value) or inspect.isclass(value):
+        return None
+    if isinstance(value, (list, tuple, dict)) or (scan_objects and hasattr(value, "__dict__")):
+        return (id(value), scan_objects)
+    return None
 
 
 def collect_transferable_tensors(model: nn.Module, processed_layout: bool) -> list[tuple[str, torch.Tensor]]:
-    seen: dict[str, int] = {}
-    seen_tensors: dict[tuple[Any, ...], int] = {}
+    """Collect each tensor range once using order-independent, shortest-path IDs.
+
+    Finish an entire BFS layer before expanding the next. Each node takes the
+    smallest ID offered by its shortest-path predecessors; no alias paths are
+    enumerated. Addresses are used only for local tensor-range deduplication.
+    """
+    root_key = (id(model), False)
+    frontier = {root_key: hashlib.sha256(b"rfork-tensor-id").digest()}
+    # Keep strong references throughout the scan so object IDs cannot be reused.
+    objects: dict[tuple[Any, ...], tuple[Any, bool]] = {root_key: (model, False)}
+    visited: set[tuple[Any, ...]] = set()
+    tensor_metadata: dict[int, tuple[torch.Tensor, tuple[Any, ...] | None]] = {}
     collected: list[tuple[str, torch.Tensor]] = []
-    for name, tensor in model.named_parameters():
-        _try_collect(name, tensor, seen, seen_tensors, collected)
-    for name, tensor in model.named_buffers():
-        _try_collect(name, tensor, seen, seen_tensors, collected)
-    roots: list[tuple[str, Any, bool]] = []
-    for module_prefix, module in model.named_modules():
-        attributes: Iterable[tuple[str, Any, bool]]
-        if processed_layout:
-            attributes = (
-                (name, value, name == "impl")
-                for name, value in vars(module).items()
-                if not name.startswith("_") and not isinstance(value, nn.Module)
-            )
-        else:
-            impl = getattr(module, "impl", None)
-            attributes = () if impl is None or isinstance(impl, nn.Module) else (("impl", impl, True),)
+    collected_ids: set[str] = set()
 
-        for attr_name, attr_value, scan_objects in attributes:
-            attr_path = f"{module_prefix}.{attr_name}" if module_prefix else attr_name
-            roots.append((attr_path, attr_value, scan_objects))
+    while frontier:
+        # IDs in this layer are final. Ignore back edges, cycles, and longer paths.
+        visited.update(frontier)
+        next_frontier: dict[tuple[Any, ...], bytes] = {}
+        for key, node_id in frontier.items():
+            value, scan_objects = objects[key]
+            if isinstance(value, torch.Tensor):
+                tensor_id = node_id.hex()
+                if tensor_id in collected_ids:
+                    raise ValueError(f"RFork encountered conflicting tensor IDs: {tensor_id!r}")
+                collected_ids.add(tensor_id)
+                collected.append((tensor_id, value))
+                continue
 
-    indexed_roots, children, tensors = _build_tensor_attribute_graph(roots)
-    for attr_path, key in indexed_roots:
-        for tensor_name, tensor in _iter_tensors_in_graph(attr_path, key, children, tensors, set()):
-            _try_collect(tensor_name, tensor, seen, seen_tensors, collected)
+            for kind, name, item, child_scan_objects in _iter_tensor_children(value, scan_objects, processed_layout):
+                child_key = _tensor_child_key(kind, name, item, child_scan_objects, tensor_metadata)
+                if child_key is None or child_key in visited:
+                    continue
+                candidate_id = _tensor_edge_id(node_id, kind, name)
+                previous_id = next_frontier.get(child_key)
+                if previous_id is None:
+                    objects[child_key] = (item, child_scan_objects)
+                    next_frontier[child_key] = candidate_id
+                elif candidate_id < previous_id:
+                    next_frontier[child_key] = candidate_id
+        frontier = next_frontier
     return collected
 
 
