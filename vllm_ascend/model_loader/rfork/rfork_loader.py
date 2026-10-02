@@ -15,12 +15,14 @@
 #
 
 import gc
+import logging
 import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any, cast
 
 import torch
@@ -65,6 +67,7 @@ FALLBACK_CLEANUP_MAX_ATTEMPTS = 2
 FALLBACK_MEMORY_RECLAIM_PASSES = 4
 RFORK_FALLBACK_EXCEPTIONS = (ImportError, OSError, RuntimeError, ValueError)
 INITIAL_ASCEND_MOE_COUNTER = -1
+POST_LOAD_TIMING_SAMPLE_LIMIT = 10
 
 
 @dataclass
@@ -469,6 +472,96 @@ def _refresh_rfork_flatquant_state(model: Module) -> None:
         module.aclnn_clip_ratio = clip_ratio.item()
 
 
+@contextmanager
+def _rfork_post_load_timing(model: Module, session: RForkSession):
+    """Measure inclusive host hook time without adding device synchronization."""
+    # Host time includes allocation, operator submission and implicit device waits.
+    if not logger.isEnabledFor(logging.DEBUG):
+        yield
+        return
+
+    modules = list(model.named_modules())
+    module_names = {id(module): name or "<root>" for name, module in modules}
+    missing = object()
+    restored: list[tuple[Any, Any]] = []
+    wrapped_owners: set[int] = set()
+    records: list[tuple[str, str, str, float, bool]] = []
+    active_hook = False
+
+    def wrap_hook(owner: Any, stage: str, module_name: str) -> None:
+        if owner is None or id(owner) in wrapped_owners:
+            return
+        original = getattr(owner, "process_weights_after_loading", None)
+        if not callable(original):
+            return
+        implementation = getattr(owner, "quant_method" if stage == "quant" else "impl", None)
+        implementation_name = type(owner if implementation is None else implementation).__qualname__
+
+        @wraps(original)
+        def timed_hook(*args: Any, **kwargs: Any):
+            nonlocal active_hook
+            # A module hook can call another wrapped hook; count it only in its outer owner.
+            if active_hook:
+                return original(*args, **kwargs)
+            active_hook = True
+            started_at = time.perf_counter()
+            succeeded = False
+            try:
+                result = original(*args, **kwargs)
+                succeeded = True
+                return result
+            finally:
+                elapsed = time.perf_counter() - started_at
+                layer = args[0] if args else kwargs.get("layer")
+                name = module_names.get(id(layer), module_name) if stage == "quant" else module_name
+                records.append((stage, name, implementation_name, elapsed, succeeded))
+                active_hook = False
+
+        restored.append((owner, vars(owner).get("process_weights_after_loading", missing)))
+        wrapped_owners.add(id(owner))
+        owner.process_weights_after_loading = timed_hook
+
+    process_started_at = None
+    try:
+        for name, module in modules:
+            wrap_hook(getattr(module, "quant_method", None), "quant", name or "<root>")
+            wrap_hook(module, "attention", name or "<root>")
+        process_started_at = time.perf_counter()
+        yield
+    finally:
+        process_host = 0.0 if process_started_at is None else time.perf_counter() - process_started_at
+        for owner, previous in reversed(restored):
+            if previous is missing:
+                del owner.process_weights_after_loading
+            else:
+                owner.process_weights_after_loading = previous
+        groups: dict[tuple[str, str], dict[str, Any]] = {}
+        for stage, _, implementation, elapsed, succeeded in records:
+            group = groups.setdefault((stage, implementation), {"calls": 0, "host_s": 0.0, "failures": 0})
+            group["calls"] += 1
+            group["host_s"] += elapsed
+            group["failures"] += not succeeded
+        hook_host = sum(record[3] for record in records)
+        slowest = [
+            {"stage": stage, "module": name, "implementation": implementation, "host_s": elapsed, "ok": succeeded}
+            for stage, name, implementation, elapsed, succeeded in sorted(
+                records, key=lambda record: record[3], reverse=True
+            )[:POST_LOAD_TIMING_SAMPLE_LIMIT]
+        ]
+        logger.debug(
+            "RFork %s post-load hooks: tp_rank=%s process_host=%.4fs hook_host=%.4fs other_host=%.4fs "
+            "calls=%d groups=%s slowest=%s",
+            _rfork_model_kind(session),
+            getattr(session.identity, "tp_rank", 0),
+            process_host,
+            hook_host,
+            process_host - hook_host,
+            len(records),
+            groups,
+            slowest,
+        )
+
+
 @register_model_loader("rfork")
 class RForkModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
@@ -653,10 +746,24 @@ class RForkModelLoader(BaseModelLoader):
                         "RFork %s model uses post-load tensor layout transfer.",
                         _rfork_model_kind(session),
                     )
-                    with _rfork_pre_transfer_weight_processing(model):
+                    process_started_at = time.perf_counter()
+                    with (
+                        _rfork_pre_transfer_weight_processing(model),
+                        _rfork_post_load_timing(model, session),
+                    ):
                         process_weights_after_loading(model, model_config, target_device)
+                    process_host = time.perf_counter() - process_started_at
                     # Complete async NPU layout conversion before exposing buffers.
+                    sync_started_at = time.perf_counter()
                     torch.npu.synchronize()
+                    sync_wait = time.perf_counter() - sync_started_at
+                    logger.debug(
+                        "RFork %s layout processing stages: process_host=%.4fs synchronize_wait=%.4fs total=%.4fs",
+                        _rfork_model_kind(session),
+                        process_host,
+                        sync_wait,
+                        time.perf_counter() - layout_start_time,
+                    )
                     logger.debug(
                         "RFork %s model layout processing took %.2f seconds",
                         _rfork_model_kind(session),
