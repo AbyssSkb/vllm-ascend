@@ -36,6 +36,10 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Attach readable model metadata to RFork planner requests; default: 0.
+    # Valid values: 0, 1, true, false (case-insensitive, whitespace ignored).
+    # This switch is non-sensitive; enabled headers carry model identifiers in plain text.
+    "RFORK_MODEL_IDENTITY_HEADERS": lambda: os.getenv("RFORK_MODEL_IDENTITY_HEADERS", "0").strip().lower(),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
