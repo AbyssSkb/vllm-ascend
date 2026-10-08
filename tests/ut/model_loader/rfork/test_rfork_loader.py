@@ -332,7 +332,7 @@ def test_rfork_draft_load_passes_target_registered_blocks_to_session(monkeypatch
         def log_transferred_model_layout(self, model, processed_layout):
             events.append("layout_summary")
 
-        def start_seed_service(self, model, processed_layout, exclude_blocks=None):
+        def start_seed_service(self, model, processed_layout, exclude_blocks=None, *, structural_digest=None):
             events.append("start_seed_service")
             captured_blocks.append(list(exclude_blocks or []))
             return True
@@ -407,9 +407,12 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
             return True
 
         def log_transferred_model_layout(self, model, processed_layout):
+            assert not model.training
             events.append("layout_summary")
+            return "final-digest"
 
-        def start_seed_service(self, model, processed_layout, exclude_blocks=None):
+        def start_seed_service(self, model, processed_layout, exclude_blocks=None, *, structural_digest=None):
+            assert structural_digest == "final-digest"
             events.append("start_seed_service")
             return True
 
@@ -481,7 +484,7 @@ def test_rfork_model_preparation_failure_does_not_acquire_seed(monkeypatch, fail
         def prepare_for_fallback(self):
             return RForkFallbackCleanupResult(True, True, True)
 
-        def start_seed_service(self, model, processed_layout, exclude_blocks=None):
+        def start_seed_service(self, model, processed_layout, exclude_blocks=None, *, structural_digest=None):
             return True
 
     session = _Session()
@@ -737,6 +740,8 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
     model = _Model()
 
     class _Session:
+        identity = SimpleNamespace(is_draft_model=False)
+
         def register_destination(self, model, processed_layout, exclude_blocks=None):
             return True
 
@@ -751,7 +756,7 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
         def log_transferred_model_layout(self, model, processed_layout):
             events.append("layout_summary")
 
-        def start_seed_service(self, model, processed_layout, exclude_blocks=None):
+        def start_seed_service(self, model, processed_layout, exclude_blocks=None, *, structural_digest=None):
             events.append("start_seed_service")
             return RForkSeedServiceStartResult.FAILED
 
@@ -813,7 +818,7 @@ def test_rfork_fallback_seed_is_deferred_when_only_lease_release_is_pending(monk
         def prepare_for_fallback(self):
             return RForkFallbackCleanupResult(service_stopped=True, lease_released=False, memory_reset=True)
 
-        def start_seed_service(self, model, processed_layout, exclude_blocks=None):
+        def start_seed_service(self, model, processed_layout, exclude_blocks=None, *, structural_digest=None):
             seed_start_models.append(model)
             return RForkSeedServiceStartResult.DEFERRED
 
@@ -916,7 +921,7 @@ def test_rfork_fallback_clears_only_failed_model_state_before_reinit(monkeypatch
         acquire_seed=lambda: True,
         transfer_from_seed=lambda model, processed_layout: False,
         prepare_for_fallback=lambda: RForkFallbackCleanupResult(True, True, True),
-        start_seed_service=lambda model, processed_layout, exclude_blocks=None: True,
+        start_seed_service=lambda model, processed_layout, exclude_blocks=None, **kwargs: True,
     )
 
     monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: rfork_session)
@@ -999,7 +1004,7 @@ def test_rfork_seed_miss_fallback_preserves_existing_process_global_state(monkey
         register_destination=lambda model, processed_layout, exclude_blocks=None: True,
         acquire_seed=lambda: False,
         prepare_for_fallback=lambda: RForkFallbackCleanupResult(True, True, True),
-        start_seed_service=lambda model, processed_layout, exclude_blocks=None: True,
+        start_seed_service=lambda model, processed_layout, exclude_blocks=None, **kwargs: True,
     )
 
     monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: rfork_session)
