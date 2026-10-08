@@ -487,6 +487,7 @@ def _rfork_post_load_timing(model: Module, session: RForkSession):
     wrapped_owners: set[int] = set()
     records: list[tuple[str, str, str, float, bool]] = []
     active_hook = False
+    linear_stages: dict[str, Any] | None = None
 
     def wrap_hook(owner: Any, stage: str, module_name: str) -> None:
         if owner is None or id(owner) in wrapped_owners:
@@ -499,12 +500,25 @@ def _rfork_post_load_timing(model: Module, session: RForkSession):
 
         @wraps(original)
         def timed_hook(*args: Any, **kwargs: Any):
-            nonlocal active_hook
+            nonlocal active_hook, linear_stages
             # A module hook can call another wrapped hook; count it only in its outer owner.
             if active_hook:
                 return original(*args, **kwargs)
             active_hook = True
             started_at = time.perf_counter()
+            layer = args[0] if args else kwargs.get("layer")
+            name = module_names.get(id(layer), module_name) if stage == "quant" else module_name
+            stages = None
+            if (
+                stage == "quant"
+                and implementation_name == "AscendW8A8DynamicLinearMethod"
+                and name.rsplit(".", 1)[-1] == "wq_a"
+                and linear_stages is None
+                and isinstance(layer, Module)
+            ):
+                stages = linear_stages = {"module": name}
+                previous_stages = vars(layer).get("_rfork_post_load_stages", missing)
+                layer._rfork_post_load_stages = stages
             succeeded = False
             try:
                 result = original(*args, **kwargs)
@@ -512,9 +526,13 @@ def _rfork_post_load_timing(model: Module, session: RForkSession):
                 return result
             finally:
                 elapsed = time.perf_counter() - started_at
-                layer = args[0] if args else kwargs.get("layer")
-                name = module_names.get(id(layer), module_name) if stage == "quant" else module_name
                 records.append((stage, name, implementation_name, elapsed, succeeded))
+                if stages is not None:
+                    stages.update(host_s=elapsed, ok=succeeded)
+                    if previous_stages is missing:
+                        del layer._rfork_post_load_stages
+                    else:
+                        layer._rfork_post_load_stages = previous_stages
                 active_hook = False
 
         restored.append((owner, vars(owner).get("process_weights_after_loading", missing)))
@@ -560,6 +578,13 @@ def _rfork_post_load_timing(model: Module, session: RForkSession):
             groups,
             slowest,
         )
+        if linear_stages is not None:
+            logger.debug(
+                "RFork %s first W8A8 linear stages: tp_rank=%s details=%s",
+                _rfork_model_kind(session),
+                getattr(session.identity, "tp_rank", 0),
+                linear_stages,
+            )
 
 
 @register_model_loader("rfork")
@@ -741,6 +766,15 @@ class RForkModelLoader(BaseModelLoader):
                     return model
 
                 if processed_layout_transfer:
+                    if self.rfork_config.post_load_init_sync:
+                        init_sync_started_at = time.perf_counter()
+                        torch.npu.synchronize()
+                        logger.debug(
+                            "RFork %s post-load initialization drain: tp_rank=%s synchronize_wait=%.4fs",
+                            _rfork_model_kind(session),
+                            getattr(session.identity, "tp_rank", 0),
+                            time.perf_counter() - init_sync_started_at,
+                        )
                     layout_start_time = time.perf_counter()
                     logger.debug(
                         "RFork %s model uses post-load tensor layout transfer.",

@@ -63,6 +63,8 @@ class RForkConfig:
     heartbeat_interval_sec: float = DEFAULT_RFORK_HEARTBEAT_INTERVAL_SEC
     lease_release_max_attempts: int = DEFAULT_RFORK_LEASE_RELEASE_MAX_ATTEMPTS
     lease_release_retry_interval_sec: float = DEFAULT_RFORK_LEASE_RELEASE_RETRY_INTERVAL_SEC
+    # Diagnostic only: drain initialization work before measuring post-load processing.
+    post_load_init_sync: bool = False
 
     def __post_init__(self) -> None:
         # Operational settings are JSON-only; reject typos instead of using similar environment variables.
@@ -76,6 +78,8 @@ class RForkConfig:
         port_base = self.seed_port_base
         if isinstance(port_base, bool) or not isinstance(port_base, int) or port_base < 0 or port_base > 65535:
             raise ValueError("rfork_seed_port_base must be a JSON integer in range [0, 65535]")
+        if not isinstance(self.post_load_init_sync, bool):
+            raise ValueError("rfork_post_load_init_sync must be a JSON boolean")
 
     @classmethod
     def from_extra_config(cls, raw_config: object) -> "RForkConfig":
@@ -127,6 +131,7 @@ class RForkConfig:
                 or "0.0.0.0"
             ),
             seed_port_base=config.get("rfork_seed_port_base", 0),
+            post_load_init_sync=config.get("rfork_post_load_init_sync", False),
             seed_advertise_host=_string_value(
                 config,
                 "rfork_seed_advertise_host",

@@ -470,8 +470,9 @@ def test_post_load_timing_preserves_moe_validation_bypass_and_restores_both_cont
     assert slowest[0]["ok"] is not should_fail
 
 
+@pytest.mark.parametrize("init_sync", [False, True])
 def test_processed_layout_load_separates_host_processing_and_existing_sync_before_registration(
-    rfork_helpers, post_load_clock, monkeypatch, caplog
+    rfork_helpers, post_load_clock, monkeypatch, caplog, init_sync
 ):
     loader_module = rfork_helpers.loader
     events = []
@@ -498,13 +499,14 @@ def test_processed_layout_load_separates_host_processing_and_existing_sync_befor
         loaded_model.quant_method.process_weights_after_loading(loaded_model)
 
     def synchronize():
-        events.append("synchronize")
-        post_load_clock.now += 4
+        is_init_drain = events[-1] == "initialize"
+        events.append("init_drain" if is_init_drain else "synchronize")
+        post_load_clock.now += 6 if is_init_drain else 4
 
     def register_destination(loaded_model, processed_layout, exclude_blocks):
         assert loaded_model is model and processed_layout and exclude_blocks == []
         assert events[-1] == "synchronize"
-        assert post_load_clock.now == 12
+        assert post_load_clock.now == 12 + 6 * init_sync
         events.append("register")
         return True
 
@@ -523,6 +525,7 @@ def test_processed_layout_load_separates_host_processing_and_existing_sync_befor
     )
     loader = object.__new__(loader_module.RForkModelLoader)
     loader.load_config = SimpleNamespace(device=None)
+    loader.rfork_config = SimpleNamespace(post_load_init_sync=init_sync)
     monkeypatch.setattr(loader, "_ensure_rfork_session", lambda *args: session)
     monkeypatch.setattr(loader, "_get_target_registered_blocks", lambda *args: [])
     monkeypatch.setattr(loader_module, "initialize_model", initialize_model)
@@ -543,12 +546,134 @@ def test_processed_layout_load_separates_host_processing_and_existing_sync_befor
     with caplog.at_level(logging.DEBUG, logger=loader_module.logger.name):
         assert loader.load_model(vllm_config, model_config) is model
 
-    assert events == ["initialize", "process", "synchronize", "register", "acquire", "transfer", "seed"]
+    expected_events = ["initialize"] + (["init_drain"] if init_sync else [])
+    assert events == expected_events + ["process", "synchronize", "register", "acquire", "transfer", "seed"]
     assert torch.equal(model.weight, torch.full((2,), 9.0))
     assert not model.training
     stages = [record for record in caplog.records if "layout processing stages:" in record.message]
     assert len(stages) == 1
     assert stages[0].args == ("main", 3, 4, 7)
+    drain_logs = [record for record in caplog.records if "post-load initialization drain:" in record.message]
+    assert len(drain_logs) == int(init_sync)
+    if init_sync:
+        assert drain_logs[0].args == ("main", 0, 6)
     assert "process_weights_after_loading" not in vars(model.quant_method)
     _, _, process_host, hook_host, other_host, calls, _, _ = _post_load_log_args(caplog)
     assert (process_host, hook_host, other_host, calls) == (3, 3, 0, 1)
+
+
+@pytest.mark.parametrize(
+    ("level", "had_marker", "should_fail"),
+    [
+        (logging.DEBUG, False, False),
+        (logging.DEBUG, True, False),
+        (logging.DEBUG, False, True),
+        (logging.DEBUG, True, True),
+        (logging.INFO, False, False),
+    ],
+)
+def test_first_w8a8_wq_a_stages_are_sampled_once_and_marker_is_restored(
+    rfork_helpers, post_load_clock, caplog, level, had_marker, should_fail
+):
+    """Sample the first wq_a and restore its marker even when nested processing fails."""
+    observed_markers = []
+    original_marker = {"preserved": True}
+    error = ValueError("first W8A8 conversion failed")
+
+    def process_weights_after_loading(self, layer):
+        marker = getattr(layer, "_rfork_post_load_stages", None)
+        observed_markers.append(marker)
+        if marker is not None:
+            assert marker is not original_marker
+            marker.update(transpose_copy_host=1.0, nz_cast_host=2.0, weight_shape=(2,), weight_dtype="torch.float32")
+        layer.weight.add_(1)
+        post_load_clock.now += 3
+        if should_fail and layer is model.layers[0].wq_a:
+            raise error
+        return layer.weight
+
+    scheme_type = type(
+        "AscendW8A8DynamicLinearMethod", (), {"process_weights_after_loading": process_weights_after_loading}
+    )
+
+    class Adapter:
+        def __init__(self):
+            self.quant_method = scheme_type()
+
+        def process_weights_after_loading(self, layer):
+            return layer.process_weights_after_loading()
+
+    class Layer(Module):
+        def __init__(self, adapter):
+            super().__init__()
+            self.quant_method = adapter
+            self.register_buffer("weight", torch.zeros(2))
+
+        def process_weights_after_loading(self):
+            return self.quant_method.quant_method.process_weights_after_loading(self)
+
+    adapter = Adapter()
+    model = Module()
+    model.q_proj = Layer(adapter)
+    model.layers = torch.nn.ModuleList([Module(), Module()])
+    model.layers[0].wq_a = Layer(adapter)
+    model.layers[1].wq_a = Layer(adapter)
+    first = model.layers[0].wq_a
+    second = model.layers[1].wq_a
+    if had_marker:
+        first._rfork_post_load_stages = original_marker
+    session = SimpleNamespace(identity=SimpleNamespace(is_draft_model=False, tp_rank=2))
+    expectation = pytest.raises(ValueError) if should_fail else nullcontext()
+
+    with (
+        caplog.at_level(level, logger=rfork_helpers.loader.logger.name),
+        expectation as raised,
+        rfork_helpers.loader._rfork_post_load_timing(model, session),
+    ):
+        assert adapter.process_weights_after_loading(model.q_proj) is model.q_proj.weight
+        assert adapter.process_weights_after_loading(first) is first.weight
+        assert adapter.process_weights_after_loading(second) is second.weight
+
+    if should_fail:
+        assert raised.value is error
+    if had_marker:
+        assert first._rfork_post_load_stages is original_marker
+        assert original_marker == {"preserved": True}
+    else:
+        assert "_rfork_post_load_stages" not in vars(first)
+    assert "_rfork_post_load_stages" not in vars(second)
+    assert "process_weights_after_loading" not in vars(adapter)
+    assert all("process_weights_after_loading" not in vars(layer) for layer in (model.q_proj, first, second))
+    assert observed_markers[0] is None
+    sample_logs = [record for record in caplog.records if "first W8A8 linear stages:" in record.message]
+    if level == logging.INFO:
+        assert observed_markers == [None, None, None]
+        assert sample_logs == []
+        assert not any("post-load hooks:" in record.message for record in caplog.records)
+        return
+
+    assert isinstance(observed_markers[1], dict)
+    if not should_fail:
+        assert observed_markers[2] is None
+    assert len(sample_logs) == 1
+    kind, rank, details = sample_logs[0].args
+    assert (kind, rank) == ("main", 2)
+    assert details == {
+        "module": "layers.0.wq_a",
+        "host_s": 3,
+        "ok": not should_fail,
+        "transpose_copy_host": 1.0,
+        "nz_cast_host": 2.0,
+        "weight_shape": (2,),
+        "weight_dtype": "torch.float32",
+    }
+    _, _, process_host, hook_host, other_host, calls, groups, _ = _post_load_log_args(caplog)
+    expected_calls = 2 if should_fail else 3
+    assert (process_host, hook_host, other_host, calls) == (3 * expected_calls, 3 * expected_calls, 0, expected_calls)
+    assert groups == {
+        ("quant", "AscendW8A8DynamicLinearMethod"): {
+            "calls": expected_calls,
+            "host_s": 3 * expected_calls,
+            "failures": int(should_fail),
+        }
+    }

@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -124,7 +125,22 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
         return output
 
     def process_weights_after_loading(self, layer):
+        # RFork attaches this dictionary only during its first wq_a hook at DEBUG.
+        stages = getattr(layer, "_rfork_post_load_stages", None)
+        if stages is not None:
+            stages.update(
+                weight_shape=tuple(layer.weight.shape),
+                weight_dtype=str(layer.weight.dtype),
+                weight_stride=layer.weight.stride(),
+                weight_logical_bytes=layer.weight.numel() * layer.weight.element_size(),
+                scale_shape=tuple(layer.weight_scale.shape),
+                scale_dtype=str(layer.weight_scale.dtype),
+                weight_nz_mode=get_ascend_config().weight_nz_mode,
+            )
+            stage_started_at = time.perf_counter()
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+        if stages is not None:
+            stages["transpose_contiguous_host_s"] = time.perf_counter() - stage_started_at
         if "wq_b" in getattr(layer, "prefix", "") and layer.weight.shape[1] >= 65536 and enable_dsa_cp():
             # TODO(jianzs): Remove this workaround after
             # `torch_npu.npu_quant_matmul` supports large weight dimensions.
@@ -144,10 +160,18 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
             del layer.weight_offset
         else:
             # cast quantized weight tensors in NZ format for higher inference speed
+            if stages is not None:
+                stage_started_at = time.perf_counter()
             if self.act_quant_type == torch.int8:
                 layer.weight.data = maybe_trans_nz(layer.weight.data)
+            if stages is not None:
+                stages["nz_host_s"] = time.perf_counter() - stage_started_at
             layer.weight_scale.data = layer.weight_scale.data.flatten()
+            if stages is not None:
+                stage_started_at = time.perf_counter()
             layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
+            if stages is not None:
+                stages["scale_fp32_host_s"] = time.perf_counter() - stage_started_at
             layer.weight_offset.data = layer.weight_offset.data.flatten()
 
 

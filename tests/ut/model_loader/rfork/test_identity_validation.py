@@ -795,6 +795,27 @@ def test_seed_port_base_rejects_non_integer_extra_config(monkeypatch, value):
         config.RForkConfig.from_extra_config({"rfork_seed_port_base": value})
 
 
+def test_post_load_init_sync_is_disabled_by_default(monkeypatch):
+    config = _load_module(monkeypatch, "rfork_test_config", "config.py")
+    assert config.RForkConfig.from_extra_config(None).post_load_init_sync is False
+    assert config.RForkConfig("model", "strategy", "planner").post_load_init_sync is False
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_post_load_init_sync_accepts_json_boolean(monkeypatch, value):
+    config = _load_module(monkeypatch, "rfork_test_config", "config.py")
+    assert config.RForkConfig.from_extra_config({"rfork_post_load_init_sync": value}).post_load_init_sync is value
+
+
+@pytest.mark.parametrize("value", ["true", "false", 0, 1, 1.0, None, [], {}])
+def test_post_load_init_sync_rejects_non_boolean_extra_config(monkeypatch, value):
+    config = _load_module(monkeypatch, "rfork_test_config", "config.py")
+    with pytest.raises(ValueError, match="rfork_post_load_init_sync must be a JSON boolean"):
+        config.RForkConfig.from_extra_config({"rfork_post_load_init_sync": value})
+    with pytest.raises(ValueError, match="rfork_post_load_init_sync must be a JSON boolean"):
+        config.RForkConfig("model", "strategy", "planner", post_load_init_sync=value)
+
+
 def test_build_seed_key_rejects_missing_identity_values(identity_module):
     build = identity_module.build_seed_key
     with pytest.raises(RuntimeError, match="model_url"):
