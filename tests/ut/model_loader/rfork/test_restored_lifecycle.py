@@ -3,9 +3,11 @@
 
 import logging
 import sys
+import weakref
 from contextlib import nullcontext
 from functools import wraps
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -61,7 +63,7 @@ def rfork_helpers(monkeypatch):
     package("vllm_ascend")
     package("vllm_ascend.device")
     install("vllm_ascend.ascend_config", get_ascend_config=lambda: SimpleNamespace(enable_fused_mc2=0))
-    install("vllm_ascend.utils", is_310p=lambda: False)
+    install("vllm_ascend.utils", is_310p=lambda: False, maybe_trans_nz=lambda weight: weight)
     package("vllm_ascend.model_loader")
     package("vllm_ascend.model_loader.rfork")
 
@@ -99,7 +101,14 @@ def rfork_helpers(monkeypatch):
             super().__init__()
             self._quant_method = quant_method
 
-    install("vllm_ascend.ops.fused_moe.fused_moe", AscendMoERunner=AscendMoERunner)
+    class AscendUnquantizedFusedMoEMethod:
+        pass
+
+    install(
+        "vllm_ascend.ops.fused_moe.fused_moe",
+        AscendMoERunner=AscendMoERunner,
+        AscendUnquantizedFusedMoEMethod=AscendUnquantizedFusedMoEMethod,
+    )
 
     rotary_module = install(
         "vllm_ascend.ops.rotary_embedding",
@@ -470,10 +479,11 @@ def test_post_load_timing_preserves_moe_validation_bypass_and_restores_both_cont
     assert slowest[0]["ok"] is not should_fail
 
 
-@pytest.mark.parametrize("init_sync", [False, True])
-def test_processed_layout_load_separates_host_processing_and_existing_sync_before_registration(
-    rfork_helpers, post_load_clock, monkeypatch, caplog, init_sync
+@pytest.mark.parametrize("processed_layout", [False, True])
+def test_load_limits_nz_probe_to_processed_layout_and_preserves_transfer_order(
+    rfork_helpers, post_load_clock, monkeypatch, caplog, processed_layout
 ):
+    """Run the temporary experiment before hooks without changing raw-layout loading or weights."""
     loader_module = rfork_helpers.loader
     events = []
 
@@ -485,7 +495,7 @@ def test_processed_layout_load_separates_host_processing_and_existing_sync_befor
     model = Module()
     model.register_buffer("weight", torch.ones(2))
     model.quant_method = QuantMethod()
-    model_config = SimpleNamespace(dtype=torch.float32, quantization="w8a8")
+    model_config = SimpleNamespace(dtype=torch.float32, quantization="w8a8" if processed_layout else None)
     vllm_config = SimpleNamespace(device_config=SimpleNamespace(device="cpu"))
 
     def initialize_model(**kwargs):
@@ -498,20 +508,25 @@ def test_processed_layout_load_separates_host_processing_and_existing_sync_befor
         events.append("process")
         loaded_model.quant_method.process_weights_after_loading(loaded_model)
 
-    def synchronize():
+    def synchronize(device=None):
         is_init_drain = events[-1] == "initialize"
+        assert device == (torch.device("cpu") if is_init_drain else None)
         events.append("init_drain" if is_init_drain else "synchronize")
         post_load_clock.now += 6 if is_init_drain else 4
 
-    def register_destination(loaded_model, processed_layout, exclude_blocks):
-        assert loaded_model is model and processed_layout and exclude_blocks == []
-        assert events[-1] == "synchronize"
-        assert post_load_clock.now == 12 + 6 * init_sync
+    def register_destination(loaded_model, transfer_processed_layout, exclude_blocks):
+        assert loaded_model is model and transfer_processed_layout == processed_layout and exclude_blocks == []
+        if processed_layout:
+            assert events[-1] == "synchronize"
+            assert post_load_clock.now == 19
+        else:
+            assert events[-1] == "initialize" and post_load_clock.now == 5
         events.append("register")
         return True
 
-    def transfer_from_seed(loaded_model, processed_layout):
-        assert torch.equal(loaded_model.weight, torch.full((2,), 2.0))
+    def transfer_from_seed(loaded_model, transfer_processed_layout):
+        assert transfer_processed_layout == processed_layout
+        assert torch.equal(loaded_model.weight, torch.full((2,), 2.0 if processed_layout else 1.0))
         events.append("transfer")
         loaded_model.weight.fill_(9)
         return True
@@ -525,7 +540,17 @@ def test_processed_layout_load_separates_host_processing_and_existing_sync_befor
     )
     loader = object.__new__(loader_module.RForkModelLoader)
     loader.load_config = SimpleNamespace(device=None)
-    loader.rfork_config = SimpleNamespace(post_load_init_sync=init_sync)
+    loader.rfork_config = SimpleNamespace(post_load_init_sync=False)
+
+    def probe_nz_conversion(target_device, probe_session):
+        assert processed_layout
+        assert target_device == torch.device("cpu") and probe_session is session
+        assert events[-1] == "init_drain"
+        assert torch.equal(model.weight, torch.ones(2))
+        events.append("probe")
+        post_load_clock.now += 1
+
+    monkeypatch.setattr(loader_module, "_rfork_probe_nz_conversion", probe_nz_conversion)
     monkeypatch.setattr(loader, "_ensure_rfork_session", lambda *args: session)
     monkeypatch.setattr(loader, "_get_target_registered_blocks", lambda *args: [])
     monkeypatch.setattr(loader_module, "initialize_model", initialize_model)
@@ -546,20 +571,111 @@ def test_processed_layout_load_separates_host_processing_and_existing_sync_befor
     with caplog.at_level(logging.DEBUG, logger=loader_module.logger.name):
         assert loader.load_model(vllm_config, model_config) is model
 
-    expected_events = ["initialize"] + (["init_drain"] if init_sync else [])
-    assert events == expected_events + ["process", "synchronize", "register", "acquire", "transfer", "seed"]
-    assert torch.equal(model.weight, torch.full((2,), 9.0))
+    if processed_layout:
+        expected_events = ["initialize", "init_drain", "probe"]
+        assert events == expected_events + ["process", "synchronize", "register", "acquire", "transfer", "seed"]
+    else:
+        assert events == ["initialize", "register", "acquire", "transfer", "process", "seed"]
+    assert torch.equal(model.weight, torch.full((2,), 9.0 if processed_layout else 18.0))
     assert not model.training
     stages = [record for record in caplog.records if "layout processing stages:" in record.message]
-    assert len(stages) == 1
-    assert stages[0].args == ("main", 3, 4, 7)
+    assert len(stages) == int(processed_layout)
+    if processed_layout:
+        assert stages[0].args == ("main", 3, 4, 7)
     drain_logs = [record for record in caplog.records if "post-load initialization drain:" in record.message]
-    assert len(drain_logs) == int(init_sync)
-    if init_sync:
+    assert len(drain_logs) == int(processed_layout)
+    if drain_logs:
         assert drain_logs[0].args == ("main", 0, 6)
     assert "process_weights_after_loading" not in vars(model.quant_method)
-    _, _, process_host, hook_host, other_host, calls, _, _ = _post_load_log_args(caplog)
-    assert (process_host, hook_host, other_host, calls) == (3, 3, 0, 1)
+    if processed_layout:
+        _, _, process_host, hook_host, other_host, calls, _, _ = _post_load_log_args(caplog)
+        assert (process_host, hook_host, other_host, calls) == (3, 3, 0, 1)
+    else:
+        assert not any("post-load hooks:" in record.message for record in caplog.records)
+
+
+@pytest.mark.parametrize("is_draft", [False, True])
+@pytest.mark.parametrize("converted", [False, True])
+def test_nz_probe_uses_independent_inputs_and_separates_call_from_device_wait(
+    rfork_helpers, post_load_clock, monkeypatch, caplog, is_draft, converted
+):
+    loader_module = rfork_helpers.loader
+    device = torch.device("cpu")
+    events = []
+    inputs = []
+    outputs = []
+    empty = torch.empty
+    call_times = (5, 2)
+    wait_times = iter((3, 7, 11))
+
+    def allocate(shape, *, dtype, device):
+        assert device == torch.device("cpu")
+        weight = empty(shape, dtype=dtype, device="cpu")
+        inputs.append(weight)
+        events.append("allocate")
+        post_load_clock.now += 2
+        return weight
+
+    def synchronize(sync_device):
+        assert sync_device == device
+        events.append("synchronize")
+        post_load_clock.now += next(wait_times)
+
+    def cast(weight):
+        iteration = len(outputs)
+        assert weight is inputs[iteration]
+        assert events[-1] == "synchronize"
+        if iteration:
+            assert inputs[0] is not weight and inputs[0].data_ptr() != weight.data_ptr()
+            assert outputs[0]() is not None
+        events.append("cast")
+        post_load_clock.now += call_times[iteration]
+        output = weight.clone() if converted else weight
+        outputs.append(weakref.ref(output))
+        return output
+
+    monkeypatch.setattr(torch, "empty", allocate)
+    monkeypatch.setattr(torch.npu, "synchronize", synchronize)
+    monkeypatch.setattr(loader_module, "maybe_trans_nz", cast)
+    monkeypatch.setattr(loader_module, "get_ascend_config", lambda: SimpleNamespace(weight_nz_mode=int(converted)))
+    session = SimpleNamespace(identity=SimpleNamespace(is_draft_model=is_draft, tp_rank=3))
+
+    with caplog.at_level(logging.DEBUG, logger=loader_module.logger.name):
+        loader_module._rfork_probe_nz_conversion(device, session)
+
+    assert events == ["allocate", "allocate", "synchronize", "cast", "synchronize", "cast", "synchronize"]
+    kind = "draft" if is_draft else "main"
+    preparation = [record for record in caplog.records if "NZ conversion probe inputs:" in record.message]
+    assert len(preparation) == 1
+    assert preparation[0].args == (kind, 3, device, 4, 3)
+    probes = [record for record in caplog.records if "NZ conversion probe:" in record.message]
+    assert [record.levelno for record in probes] == [logging.DEBUG, logging.DEBUG]
+    assert [record.args for record in probes] == [
+        (kind, 3, 1, (4096, 1024), "torch.int8", 4194304, int(converted), converted, 5, 7, 12),
+        (kind, 3, 2, (4096, 1024), "torch.int8", 4194304, int(converted), converted, 2, 11, 13),
+    ]
+    if converted:
+        assert all(output() is None for output in outputs)
+
+
+def test_nz_probe_propagates_conversion_error_without_running_second_sample(
+    rfork_helpers, post_load_clock, monkeypatch
+):
+    loader_module = rfork_helpers.loader
+    device = torch.device("cpu")
+    error = RuntimeError("NZ conversion failed")
+    cast = Mock(side_effect=error)
+    synchronize = Mock()
+    monkeypatch.setattr(loader_module, "maybe_trans_nz", cast)
+    monkeypatch.setattr(torch.npu, "synchronize", synchronize)
+    session = SimpleNamespace(identity=SimpleNamespace(is_draft_model=False, tp_rank=0))
+
+    with pytest.raises(RuntimeError) as raised:
+        loader_module._rfork_probe_nz_conversion(device, session)
+
+    assert raised.value is error
+    assert cast.call_count == 1
+    synchronize.assert_called_once_with(device)
 
 
 @pytest.mark.parametrize(

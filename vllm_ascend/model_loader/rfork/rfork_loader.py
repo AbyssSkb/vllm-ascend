@@ -56,7 +56,7 @@ from vllm_ascend.model_loader.rfork.types import (
     RForkLifecycleState,
     RForkSeedServiceStartResult,
 )
-from vllm_ascend.utils import is_310p
+from vllm_ascend.utils import is_310p, maybe_trans_nz
 
 
 class _RForkSeedUnavailable(RuntimeError):
@@ -68,6 +68,8 @@ FALLBACK_MEMORY_RECLAIM_PASSES = 4
 RFORK_FALLBACK_EXCEPTIONS = (ImportError, OSError, RuntimeError, ValueError)
 INITIAL_ASCEND_MOE_COUNTER = -1
 POST_LOAD_TIMING_SAMPLE_LIMIT = 10
+NZ_CONVERSION_PROBE_SHAPE = (4096, 1024)
+NZ_CONVERSION_PROBE_ITERATIONS = 2
 
 
 @dataclass
@@ -422,6 +424,51 @@ def _rfork_pre_transfer_weight_processing(model: Module):
             quant_method.process_weights_after_loading = process_weights
 
 
+def _rfork_probe_nz_conversion(target_device: torch.device, session: RForkSession) -> None:
+    """Measure first/repeated NZ calls independently of model weight processing."""
+    allocation_started_at = time.perf_counter()
+    inputs = [
+        torch.empty(NZ_CONVERSION_PROBE_SHAPE, dtype=torch.int8, device=target_device)
+        for _ in range(NZ_CONVERSION_PROBE_ITERATIONS)
+    ]
+    allocation_host = time.perf_counter() - allocation_started_at
+    ready_started_at = time.perf_counter()
+    torch.npu.synchronize(target_device)
+    logger.debug(
+        "RFork %s NZ conversion probe inputs: tp_rank=%s device=%s allocation_host=%.4fs ready_wait=%.4fs",
+        _rfork_model_kind(session),
+        getattr(session.identity, "tp_rank", 0),
+        target_device,
+        allocation_host,
+        time.perf_counter() - ready_started_at,
+    )
+    # Keep both outputs alive so the repeated call cannot reuse the first output's allocation.
+    outputs = []
+    for iteration, weight in enumerate(inputs, start=1):
+        call_started_at = time.perf_counter()
+        converted_weight = maybe_trans_nz(weight)
+        call_host = time.perf_counter() - call_started_at
+        sync_started_at = time.perf_counter()
+        torch.npu.synchronize(target_device)
+        sync_wait = time.perf_counter() - sync_started_at
+        outputs.append(converted_weight)
+        logger.debug(
+            "RFork %s NZ conversion probe: tp_rank=%s iteration=%s shape=%s dtype=%s logical_bytes=%s "
+            "weight_nz_mode=%s converted=%s call_host=%.4fs synchronize_wait=%.4fs total=%.4fs",
+            _rfork_model_kind(session),
+            getattr(session.identity, "tp_rank", 0),
+            iteration,
+            tuple(weight.shape),
+            str(weight.dtype),
+            weight.numel() * weight.element_size(),
+            get_ascend_config().weight_nz_mode,
+            converted_weight is not weight,
+            call_host,
+            sync_wait,
+            call_host + sync_wait,
+        )
+
+
 def _is_dynamic_eplb_enabled(vllm_config: VllmConfig) -> bool:
     parallel_config = getattr(vllm_config, "parallel_config", None)
     if bool(getattr(parallel_config, "enable_eplb", False)):
@@ -766,15 +813,15 @@ class RForkModelLoader(BaseModelLoader):
                     return model
 
                 if processed_layout_transfer:
-                    if self.rfork_config.post_load_init_sync:
-                        init_sync_started_at = time.perf_counter()
-                        torch.npu.synchronize()
-                        logger.debug(
-                            "RFork %s post-load initialization drain: tp_rank=%s synchronize_wait=%.4fs",
-                            _rfork_model_kind(session),
-                            getattr(session.identity, "tp_rank", 0),
-                            time.perf_counter() - init_sync_started_at,
-                        )
+                    init_sync_started_at = time.perf_counter()
+                    torch.npu.synchronize(target_device)
+                    logger.debug(
+                        "RFork %s post-load initialization drain: tp_rank=%s synchronize_wait=%.4fs",
+                        _rfork_model_kind(session),
+                        getattr(session.identity, "tp_rank", 0),
+                        time.perf_counter() - init_sync_started_at,
+                    )
+                    _rfork_probe_nz_conversion(target_device, session)
                     layout_start_time = time.perf_counter()
                     logger.debug(
                         "RFork %s model uses post-load tensor layout transfer.",
