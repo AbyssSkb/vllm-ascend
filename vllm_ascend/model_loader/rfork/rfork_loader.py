@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass
 from functools import wraps
+from threading import get_ident
 from typing import Any, cast
 
 import torch
@@ -56,7 +57,7 @@ from vllm_ascend.model_loader.rfork.types import (
     RForkLifecycleState,
     RForkSeedServiceStartResult,
 )
-from vllm_ascend.utils import is_310p, maybe_trans_nz
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, ACL_FORMAT_ND, is_310p
 
 
 class _RForkSeedUnavailable(RuntimeError):
@@ -68,8 +69,6 @@ FALLBACK_MEMORY_RECLAIM_PASSES = 4
 RFORK_FALLBACK_EXCEPTIONS = (ImportError, OSError, RuntimeError, ValueError)
 INITIAL_ASCEND_MOE_COUNTER = -1
 POST_LOAD_TIMING_SAMPLE_LIMIT = 10
-NZ_CONVERSION_PROBE_SHAPE = (4096, 1024)
-NZ_CONVERSION_PROBE_ITERATIONS = 2
 
 
 @dataclass
@@ -424,48 +423,85 @@ def _rfork_pre_transfer_weight_processing(model: Module):
             quant_method.process_weights_after_loading = process_weights
 
 
-def _rfork_probe_nz_conversion(target_device: torch.device, session: RForkSession) -> None:
-    """Measure first/repeated NZ calls independently of model weight processing."""
-    allocation_started_at = time.perf_counter()
-    inputs = [
-        torch.empty(NZ_CONVERSION_PROBE_SHAPE, dtype=torch.int8, device=target_device)
-        for _ in range(NZ_CONVERSION_PROBE_ITERATIONS)
-    ]
-    allocation_host = time.perf_counter() - allocation_started_at
-    ready_started_at = time.perf_counter()
-    torch.npu.synchronize(target_device)
-    logger.debug(
-        "RFork %s NZ conversion probe inputs: tp_rank=%s device=%s allocation_host=%.4fs ready_wait=%.4fs",
-        _rfork_model_kind(session),
-        getattr(session.identity, "tp_rank", 0),
-        target_device,
-        allocation_host,
-        time.perf_counter() - ready_started_at,
-    )
-    # Keep both outputs alive so the repeated call cannot reuse the first output's allocation.
-    outputs = []
-    for iteration, weight in enumerate(inputs, start=1):
-        call_started_at = time.perf_counter()
-        converted_weight = maybe_trans_nz(weight)
-        call_host = time.perf_counter() - call_started_at
-        sync_started_at = time.perf_counter()
-        torch.npu.synchronize(target_device)
-        sync_wait = time.perf_counter() - sync_started_at
-        outputs.append(converted_weight)
+@contextmanager
+def _rfork_allocate_nz_weights(session: RForkSession):
+    """Allocate uninitialized NZ destinations; the seed supplies their final bytes."""
+    import torch_npu
+
+    original_cast = torch_npu.npu_format_cast
+    storage_owner = getattr(torch_npu._C, "_tensor_construct_from_storage", None)
+    owner_thread = get_ident()
+    allocated = 0
+    logical_bytes = 0
+    allocation_host = 0.0
+    first_allocation = None
+
+    def allocate(self, acl_format, *args, **kwargs):
+        nonlocal allocated, logical_bytes, allocation_host, first_allocation
+        weight = self
+        if (
+            get_ident() != owner_thread
+            or acl_format != ACL_FORMAT_FRACTAL_NZ
+            or weight.dtype != torch.int8
+            or weight.device.type != "npu"
+            or len(weight.shape) < 2
+            or not weight.is_contiguous()
+            or args
+            or kwargs
+        ):
+            return original_cast(weight, acl_format, *args, **kwargs)
+        source_format = torch_npu.get_npu_format(weight)
+        if source_format == ACL_FORMAT_FRACTAL_NZ:
+            return weight
+        weight_bytes = weight.numel() * weight.element_size()
+        storage = weight.untyped_storage()
+        if (
+            source_format != ACL_FORMAT_ND
+            or weight.storage_offset() != 0
+            or storage.nbytes() != weight_bytes
+            or storage_owner is None
+        ):
+            return original_cast(weight, acl_format, *args, **kwargs)
+        try:
+            owner = storage_owner(storage)
+        except (RuntimeError, TypeError):
+            return original_cast(weight, acl_format, *args, **kwargs)
+        # Native format_cast allocates from the storage descriptor, not a reshaped view.
+        if owner.shape != weight.shape or owner.stride() != weight.stride() or owner.dtype != weight.dtype:
+            return original_cast(weight, acl_format, *args, **kwargs)
+        started_at = time.perf_counter()
+        result = torch_npu.empty_with_format(
+            size=weight.shape, dtype=weight.dtype, device=weight.device, acl_format=acl_format
+        )
+        allocation_host += time.perf_counter() - started_at
+        if torch_npu.get_npu_format(result) != ACL_FORMAT_FRACTAL_NZ:
+            raise RuntimeError("RFork NZ destination allocation did not preserve format 29")
+        allocated += 1
+        logical_bytes += weight_bytes
+        if first_allocation is None:
+            first_allocation = {
+                "shape": tuple(result.shape),
+                "dtype": str(result.dtype),
+                "format": torch_npu.get_npu_format(result),
+                "storage_bytes": result.untyped_storage().nbytes(),
+            }
+        return result
+
+    # ponytail: serial worker loading only; overlapping loader contexts need isolated dispatch.
+    torch_npu.npu_format_cast = allocate
+    try:
+        yield
+    finally:
+        torch_npu.npu_format_cast = original_cast
         logger.debug(
-            "RFork %s NZ conversion probe: tp_rank=%s iteration=%s shape=%s dtype=%s logical_bytes=%s "
-            "weight_nz_mode=%s converted=%s call_host=%.4fs synchronize_wait=%.4fs total=%.4fs",
+            "RFork %s NZ destination allocations: tp_rank=%s allocated=%s logical_bytes=%s "
+            "allocation_host=%.4fs first=%s",
             _rfork_model_kind(session),
             getattr(session.identity, "tp_rank", 0),
-            iteration,
-            tuple(weight.shape),
-            str(weight.dtype),
-            weight.numel() * weight.element_size(),
-            get_ascend_config().weight_nz_mode,
-            converted_weight is not weight,
-            call_host,
-            sync_wait,
-            call_host + sync_wait,
+            allocated,
+            logical_bytes,
+            allocation_host,
+            first_allocation,
         )
 
 
@@ -821,7 +857,6 @@ class RForkModelLoader(BaseModelLoader):
                         getattr(session.identity, "tp_rank", 0),
                         time.perf_counter() - init_sync_started_at,
                     )
-                    _rfork_probe_nz_conversion(target_device, session)
                     layout_start_time = time.perf_counter()
                     logger.debug(
                         "RFork %s model uses post-load tensor layout transfer.",
@@ -830,6 +865,7 @@ class RForkModelLoader(BaseModelLoader):
                     process_started_at = time.perf_counter()
                     with (
                         _rfork_pre_transfer_weight_processing(model),
+                        _rfork_allocate_nz_weights(session),
                         _rfork_post_load_timing(model, session),
                     ):
                         process_weights_after_loading(model, model_config, target_device)

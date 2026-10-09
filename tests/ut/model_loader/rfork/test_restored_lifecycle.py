@@ -2,9 +2,10 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import logging
+import math
 import sys
-import weakref
-from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -63,7 +64,7 @@ def rfork_helpers(monkeypatch):
     package("vllm_ascend")
     package("vllm_ascend.device")
     install("vllm_ascend.ascend_config", get_ascend_config=lambda: SimpleNamespace(enable_fused_mc2=0))
-    install("vllm_ascend.utils", is_310p=lambda: False, maybe_trans_nz=lambda weight: weight)
+    install("vllm_ascend.utils", ACL_FORMAT_FRACTAL_NZ=29, ACL_FORMAT_ND=2, is_310p=lambda: False)
     package("vllm_ascend.model_loader")
     package("vllm_ascend.model_loader.rfork")
 
@@ -480,10 +481,10 @@ def test_post_load_timing_preserves_moe_validation_bypass_and_restores_both_cont
 
 
 @pytest.mark.parametrize("processed_layout", [False, True])
-def test_load_limits_nz_probe_to_processed_layout_and_preserves_transfer_order(
+def test_load_limits_nz_allocation_to_processed_layout_and_preserves_transfer_order(
     rfork_helpers, post_load_clock, monkeypatch, caplog, processed_layout
 ):
-    """Run the temporary experiment before hooks without changing raw-layout loading or weights."""
+    """Allocate NZ only while processed-layout hooks run, preserving transfer and raw-layout behavior."""
     loader_module = rfork_helpers.loader
     events = []
 
@@ -518,7 +519,7 @@ def test_load_limits_nz_probe_to_processed_layout_and_preserves_transfer_order(
         assert loaded_model is model and transfer_processed_layout == processed_layout and exclude_blocks == []
         if processed_layout:
             assert events[-1] == "synchronize"
-            assert post_load_clock.now == 19
+            assert post_load_clock.now == 18
         else:
             assert events[-1] == "initialize" and post_load_clock.now == 5
         events.append("register")
@@ -542,15 +543,19 @@ def test_load_limits_nz_probe_to_processed_layout_and_preserves_transfer_order(
     loader.load_config = SimpleNamespace(device=None)
     loader.rfork_config = SimpleNamespace(post_load_init_sync=False)
 
-    def probe_nz_conversion(target_device, probe_session):
+    @contextmanager
+    def allocate_nz_weights(allocation_session):
         assert processed_layout
-        assert target_device == torch.device("cpu") and probe_session is session
+        assert allocation_session is session
         assert events[-1] == "init_drain"
         assert torch.equal(model.weight, torch.ones(2))
-        events.append("probe")
-        post_load_clock.now += 1
+        events.append("allocation_enter")
+        try:
+            yield
+        finally:
+            events.append("allocation_exit")
 
-    monkeypatch.setattr(loader_module, "_rfork_probe_nz_conversion", probe_nz_conversion)
+    monkeypatch.setattr(loader_module, "_rfork_allocate_nz_weights", allocate_nz_weights)
     monkeypatch.setattr(loader, "_ensure_rfork_session", lambda *args: session)
     monkeypatch.setattr(loader, "_get_target_registered_blocks", lambda *args: [])
     monkeypatch.setattr(loader_module, "initialize_model", initialize_model)
@@ -572,8 +577,18 @@ def test_load_limits_nz_probe_to_processed_layout_and_preserves_transfer_order(
         assert loader.load_model(vllm_config, model_config) is model
 
     if processed_layout:
-        expected_events = ["initialize", "init_drain", "probe"]
-        assert events == expected_events + ["process", "synchronize", "register", "acquire", "transfer", "seed"]
+        assert events == [
+            "initialize",
+            "init_drain",
+            "allocation_enter",
+            "process",
+            "allocation_exit",
+            "synchronize",
+            "register",
+            "acquire",
+            "transfer",
+            "seed",
+        ]
     else:
         assert events == ["initialize", "register", "acquire", "transfer", "process", "seed"]
     assert torch.equal(model.weight, torch.full((2,), 9.0 if processed_layout else 18.0))
@@ -594,88 +609,287 @@ def test_load_limits_nz_probe_to_processed_layout_and_preserves_transfer_order(
         assert not any("post-load hooks:" in record.message for record in caplog.records)
 
 
-@pytest.mark.parametrize("is_draft", [False, True])
-@pytest.mark.parametrize("converted", [False, True])
-def test_nz_probe_uses_independent_inputs_and_separates_call_from_device_wait(
-    rfork_helpers, post_load_clock, monkeypatch, caplog, is_draft, converted
+def _nz_weight(
+    shape=(4096, 1024),
+    dtype=torch.int8,
+    device_type="npu",
+    contiguous=True,
+    npu_format=2,
+    storage_offset=0,
+    storage_bytes=None,
+    base_shape=None,
+    base_stride=None,
+    base_dtype=None,
 ):
-    loader_module = rfork_helpers.loader
-    device = torch.device("cpu")
-    events = []
-    inputs = []
-    outputs = []
-    empty = torch.empty
-    call_times = (5, 2)
-    wait_times = iter((3, 7, 11))
+    logical_bytes = math.prod(shape) * (1 if dtype == torch.int8 else 4)
+    physical_bytes = logical_bytes if storage_bytes is None else storage_bytes
+    stride = tuple(math.prod(shape[index + 1 :]) for index in range(len(shape)))
+    descriptor_shape = shape if base_shape is None else base_shape
+    descriptor_stride = tuple(math.prod(descriptor_shape[index + 1 :]) for index in range(len(descriptor_shape)))
+    storage = SimpleNamespace(
+        nbytes=lambda: physical_bytes,
+        base_shape=descriptor_shape,
+        base_stride=descriptor_stride if base_stride is None else base_stride,
+        base_dtype=dtype if base_dtype is None else base_dtype,
+    )
+    return SimpleNamespace(
+        shape=shape,
+        dtype=dtype,
+        device=SimpleNamespace(type=device_type, index=0),
+        npu_format=npu_format,
+        is_contiguous=lambda: contiguous,
+        stride=lambda: stride,
+        numel=lambda: math.prod(shape),
+        element_size=lambda: 1 if dtype == torch.int8 else 4,
+        storage_offset=lambda: storage_offset,
+        untyped_storage=lambda: storage,
+    )
 
-    def allocate(shape, *, dtype, device):
-        assert device == torch.device("cpu")
-        weight = empty(shape, dtype=dtype, device="cpu")
-        inputs.append(weight)
-        events.append("allocate")
+
+@pytest.fixture
+def nz_backend(rfork_helpers, post_load_clock, monkeypatch):
+    def allocate(*, size, dtype, device, acl_format):
         post_load_clock.now += 2
-        return weight
+        return _nz_weight(shape=size, dtype=dtype, device_type=device.type, npu_format=acl_format)
 
-    def synchronize(sync_device):
-        assert sync_device == device
-        events.append("synchronize")
-        post_load_clock.now += next(wait_times)
+    return _stub(
+        monkeypatch,
+        "torch_npu",
+        npu_format_cast=Mock(return_value=object()),
+        empty_with_format=Mock(side_effect=allocate),
+        get_npu_format=lambda weight: weight.npu_format,
+        _C=SimpleNamespace(
+            _tensor_construct_from_storage=Mock(
+                side_effect=lambda storage: SimpleNamespace(
+                    shape=storage.base_shape,
+                    stride=lambda: storage.base_stride,
+                    dtype=storage.base_dtype,
+                )
+            )
+        ),
+    )
 
-    def cast(weight):
-        iteration = len(outputs)
-        assert weight is inputs[iteration]
-        assert events[-1] == "synchronize"
-        if iteration:
-            assert inputs[0] is not weight and inputs[0].data_ptr() != weight.data_ptr()
-            assert outputs[0]() is not None
-        events.append("cast")
-        post_load_clock.now += call_times[iteration]
-        output = weight.clone() if converted else weight
-        outputs.append(weakref.ref(output))
-        return output
 
-    monkeypatch.setattr(torch, "empty", allocate)
-    monkeypatch.setattr(torch.npu, "synchronize", synchronize)
-    monkeypatch.setattr(loader_module, "maybe_trans_nz", cast)
-    monkeypatch.setattr(loader_module, "get_ascend_config", lambda: SimpleNamespace(weight_nz_mode=int(converted)))
+@pytest.mark.parametrize("shape", [(4096, 1024), (8, 4096, 1024)])
+@pytest.mark.parametrize("is_draft", [False, True])
+@pytest.mark.parametrize("use_keywords", [False, True])
+def test_nz_allocation_preserves_tensor_metadata_and_restores_cast(
+    rfork_helpers, nz_backend, caplog, shape, is_draft, use_keywords
+):
+    weight = _nz_weight(shape=shape)
+    original_cast = nz_backend.npu_format_cast
     session = SimpleNamespace(identity=SimpleNamespace(is_draft_model=is_draft, tp_rank=3))
 
-    with caplog.at_level(logging.DEBUG, logger=loader_module.logger.name):
-        loader_module._rfork_probe_nz_conversion(device, session)
+    with (
+        caplog.at_level(logging.DEBUG, logger=rfork_helpers.loader.logger.name),
+        rfork_helpers.loader._rfork_allocate_nz_weights(session),
+    ):
+        result = (
+            nz_backend.npu_format_cast(self=weight, acl_format=29)
+            if use_keywords
+            else nz_backend.npu_format_cast(weight, 29)
+        )
+        assert result is not weight
+        assert result.shape == weight.shape and result.dtype == weight.dtype
+        assert result.device.type == weight.device.type and result.npu_format == 29
 
-    assert events == ["allocate", "allocate", "synchronize", "cast", "synchronize", "cast", "synchronize"]
-    kind = "draft" if is_draft else "main"
-    preparation = [record for record in caplog.records if "NZ conversion probe inputs:" in record.message]
-    assert len(preparation) == 1
-    assert preparation[0].args == (kind, 3, device, 4, 3)
-    probes = [record for record in caplog.records if "NZ conversion probe:" in record.message]
-    assert [record.levelno for record in probes] == [logging.DEBUG, logging.DEBUG]
-    assert [record.args for record in probes] == [
-        (kind, 3, 1, (4096, 1024), "torch.int8", 4194304, int(converted), converted, 5, 7, 12),
-        (kind, 3, 2, (4096, 1024), "torch.int8", 4194304, int(converted), converted, 2, 11, 13),
-    ]
-    if converted:
-        assert all(output() is None for output in outputs)
+    assert nz_backend.npu_format_cast is original_cast
+    original_cast.assert_not_called()
+    nz_backend.empty_with_format.assert_called_once_with(
+        size=weight.shape, dtype=weight.dtype, device=weight.device, acl_format=29
+    )
+    records = [record for record in caplog.records if "NZ destination allocations:" in record.message]
+    assert len(records) == 1 and records[0].levelno == logging.DEBUG
+    assert records[0].args == (
+        "draft" if is_draft else "main",
+        3,
+        1,
+        math.prod(shape),
+        2,
+        {"shape": shape, "dtype": "torch.int8", "format": 29, "storage_bytes": math.prod(shape)},
+    )
 
 
-def test_nz_probe_propagates_conversion_error_without_running_second_sample(
-    rfork_helpers, post_load_clock, monkeypatch
-):
-    loader_module = rfork_helpers.loader
-    device = torch.device("cpu")
-    error = RuntimeError("NZ conversion failed")
-    cast = Mock(side_effect=error)
-    synchronize = Mock()
-    monkeypatch.setattr(loader_module, "maybe_trans_nz", cast)
-    monkeypatch.setattr(torch.npu, "synchronize", synchronize)
+@pytest.mark.parametrize("weight_options", [{}, {"storage_offset": 1, "storage_bytes": 8388608}])
+def test_nz_allocation_preserves_already_nz_tensor_alias(rfork_helpers, nz_backend, weight_options):
+    weight = _nz_weight(npu_format=29, **weight_options)
+    original_cast = nz_backend.npu_format_cast
     session = SimpleNamespace(identity=SimpleNamespace(is_draft_model=False, tp_rank=0))
 
-    with pytest.raises(RuntimeError) as raised:
-        loader_module._rfork_probe_nz_conversion(device, session)
+    with rfork_helpers.loader._rfork_allocate_nz_weights(session):
+        assert nz_backend.npu_format_cast(weight, 29) is weight
 
-    assert raised.value is error
-    assert cast.call_count == 1
-    synchronize.assert_called_once_with(device)
+    assert nz_backend.npu_format_cast is original_cast
+    original_cast.assert_not_called()
+    nz_backend.empty_with_format.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("weight_options", "acl_format", "args", "kwargs"),
+    [
+        ({}, 2, (), {}),
+        ({"dtype": torch.float32}, 29, (), {}),
+        ({"device_type": "cpu"}, 29, (), {}),
+        ({"contiguous": False}, 29, (), {}),
+        ({"shape": (4096,)}, 29, (), {}),
+        ({"npu_format": 3}, 29, (), {}),
+        ({"storage_offset": 1}, 29, (), {}),
+        ({"storage_bytes": 8388608}, 29, (), {}),
+        ({"base_shape": (1024, 4096)}, 29, (), {}),
+        ({"base_stride": (1, 4096)}, 29, (), {}),
+        ({"base_dtype": torch.float32}, 29, (), {}),
+        ({}, 29, (0,), {}),
+        ({}, 29, (), {"customize_dtype": 0}),
+    ],
+)
+def test_nz_allocation_preserves_unsupported_conversion_calls(
+    rfork_helpers, nz_backend, weight_options, acl_format, args, kwargs
+):
+    weight = _nz_weight(**weight_options)
+    original_cast = nz_backend.npu_format_cast
+    session = SimpleNamespace(identity=SimpleNamespace(is_draft_model=False, tp_rank=0))
+
+    with rfork_helpers.loader._rfork_allocate_nz_weights(session):
+        assert nz_backend.npu_format_cast(weight, acl_format, *args, **kwargs) is original_cast.return_value
+
+    assert nz_backend.npu_format_cast is original_cast
+    original_cast.assert_called_once_with(weight, acl_format, *args, **kwargs)
+    nz_backend.empty_with_format.assert_not_called()
+
+
+def test_nz_allocation_accepts_native_self_keyword_when_passing_cpu_tensor_through(rfork_helpers, nz_backend):
+    weight = _nz_weight(device_type="cpu")
+    original_cast = nz_backend.npu_format_cast
+    session = SimpleNamespace(identity=SimpleNamespace(is_draft_model=False, tp_rank=0))
+
+    with rfork_helpers.loader._rfork_allocate_nz_weights(session):
+        assert nz_backend.npu_format_cast(self=weight, acl_format=29) is original_cast.return_value
+
+    original_cast.assert_called_once_with(weight, 29)
+    assert nz_backend.npu_format_cast is original_cast
+    nz_backend.empty_with_format.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [None, RuntimeError("descriptor unavailable"), TypeError("unsupported storage")])
+def test_nz_allocation_preserves_original_cast_when_base_descriptor_is_unavailable(
+    rfork_helpers, nz_backend, monkeypatch, error
+):
+    weight = _nz_weight()
+    original_cast = nz_backend.npu_format_cast
+    if error is None:
+        monkeypatch.delattr(nz_backend._C, "_tensor_construct_from_storage")
+    else:
+        nz_backend._C._tensor_construct_from_storage.side_effect = error
+    session = SimpleNamespace(identity=SimpleNamespace(is_draft_model=False, tp_rank=0))
+
+    with rfork_helpers.loader._rfork_allocate_nz_weights(session):
+        assert nz_backend.npu_format_cast(weight, 29) is original_cast.return_value
+
+    assert nz_backend.npu_format_cast is original_cast
+    original_cast.assert_called_once_with(weight, 29)
+    nz_backend.empty_with_format.assert_not_called()
+
+
+@pytest.mark.parametrize("use_keywords", [False, True])
+def test_nz_allocation_does_not_intercept_other_threads(rfork_helpers, nz_backend, use_keywords):
+    weight = _nz_weight()
+    original_cast = nz_backend.npu_format_cast
+    session = SimpleNamespace(identity=SimpleNamespace(is_draft_model=False, tp_rank=0))
+
+    with rfork_helpers.loader._rfork_allocate_nz_weights(session), ThreadPoolExecutor(max_workers=1) as executor:
+        conversion = (
+            executor.submit(nz_backend.npu_format_cast, self=weight, acl_format=29)
+            if use_keywords
+            else executor.submit(nz_backend.npu_format_cast, weight, 29)
+        )
+        result = conversion.result(timeout=5)
+
+    assert result is original_cast.return_value
+    assert nz_backend.npu_format_cast is original_cast
+    original_cast.assert_called_once_with(weight, 29)
+    nz_backend.empty_with_format.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["body", "allocator", "output_format"])
+def test_nz_allocation_restores_cast_after_failure(rfork_helpers, nz_backend, failure):
+    weight = _nz_weight()
+    original_cast = nz_backend.npu_format_cast
+    error = RuntimeError("allocation or processing failed")
+    if failure == "allocator":
+        nz_backend.empty_with_format.side_effect = error
+    elif failure == "output_format":
+        nz_backend.empty_with_format.side_effect = None
+        nz_backend.empty_with_format.return_value = _nz_weight(npu_format=2)
+    session = SimpleNamespace(identity=SimpleNamespace(is_draft_model=False, tp_rank=0))
+
+    with pytest.raises(RuntimeError) as raised, rfork_helpers.loader._rfork_allocate_nz_weights(session):
+        nz_backend.npu_format_cast(weight, 29)
+        if failure == "body":
+            raise error
+
+    if failure == "output_format":
+        assert "did not preserve format 29" in str(raised.value)
+    else:
+        assert raised.value is error
+    assert nz_backend.npu_format_cast is original_cast
+    original_cast.assert_not_called()
+    assert nz_backend.empty_with_format.call_count == 1
+
+
+def test_nz_allocation_is_restored_before_seed_miss_reloads_a_new_model(rfork_helpers, nz_backend, monkeypatch):
+    loader_module = rfork_helpers.loader
+    original_cast = nz_backend.npu_format_cast
+    empty_model = Module()
+    local_model = Module()
+    local_model.register_buffer("weight", torch.full((2,), 7.0))
+    reset = Mock()
+    model_config = SimpleNamespace(dtype=torch.float32, quantization="ascend")
+    vllm_config = SimpleNamespace(device_config=SimpleNamespace(device="cpu"))
+    session = SimpleNamespace(
+        identity=SimpleNamespace(is_draft_model=False, tp_rank=0),
+        register_destination=Mock(return_value=True),
+        acquire_seed=lambda: False,
+        prepare_for_fallback=lambda: SimpleNamespace(can_schedule_seed=True),
+    )
+    loader = object.__new__(loader_module.RForkModelLoader)
+    loader.load_config = SimpleNamespace(device=None)
+    loader.rfork_config = SimpleNamespace(post_load_init_sync=False)
+
+    def process_model(model, config, target_device):
+        assert model is empty_model
+        assert nz_backend.npu_format_cast is not original_cast
+        model.destination = nz_backend.npu_format_cast(_nz_weight(), 29)
+        assert model.destination.npu_format == 29
+
+    def load_local(*args):
+        assert nz_backend.npu_format_cast is original_cast
+        reset.assert_called_once_with(vllm_config, empty_model, None)
+        assert nz_backend.npu_format_cast(_nz_weight(), 29) is original_cast.return_value
+        return local_model
+
+    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda *args: session)
+    monkeypatch.setattr(loader, "_get_target_registered_blocks", lambda *args: [])
+    monkeypatch.setattr(loader_module, "initialize_model", lambda **kwargs: empty_model)
+    monkeypatch.setattr(loader_module, "process_weights_after_loading", process_model)
+    monkeypatch.setattr(loader_module, "_snapshot_process_global_model_state", lambda *args: None)
+    monkeypatch.setattr(loader_module, "_reset_process_global_model_state", reset)
+    monkeypatch.setattr(loader_module, "_load_with_default_loader", load_local)
+    monkeypatch.setattr(loader_module, "_start_rfork_seed_service", Mock(return_value=True))
+    monkeypatch.setattr(loader_module.gc, "collect", Mock())
+    monkeypatch.setattr(
+        loader_module,
+        "get_ascend_config",
+        lambda: SimpleNamespace(
+            eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None, expert_map_path=None)
+        ),
+    )
+    monkeypatch.setattr(torch.npu, "synchronize", lambda device=None: None)
+    monkeypatch.setattr(torch.npu, "empty_cache", Mock(), raising=False)
+
+    assert loader.load_model(vllm_config, model_config) is local_model
+    assert torch.equal(local_model.weight, torch.full((2,), 7.0))
+    assert nz_backend.npu_format_cast is original_cast
+    assert nz_backend.empty_with_format.call_count == 1 and original_cast.call_count == 1
 
 
 @pytest.mark.parametrize(
