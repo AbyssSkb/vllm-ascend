@@ -1,0 +1,530 @@
+From 5c6a64021e8da5b9d9b356a1b1e48070491d9476 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Thu, 8 Oct 2026 19:40:43 +0800
+Subject: [PATCH 8/9] feat(rfork): make planner model identity headers
+ configurable
+
+Attach MODEL_URL, DEPLOY_STRATEGY and IS_DRAFT to all planner requests when enabled so the planner can display readable metadata alongside opaque seed keys.
+
+Keep the feature disabled by default. Prefer the JSON boolean configuration over the RFork environment switch, which accepts 0, 1, true and false with case and surrounding whitespace ignored. Document the option and cover configuration validation and the full planner lifecycle.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+(cherry picked from commit 040b26138d76c501885ee6c80c3f323bda188451)
+Signed-off-by: AbyssSkb <abyssskb@outlook.com>
+---
+ docs/source/user_guide/feature_guide/rfork.md |  21 +++
+ .../rfork/test_identity_validation.py         |   4 +
+ .../rfork/test_model_identity_headers.py      | 158 ++++++++++++++++++
+ .../rfork/test_planner_http_contract.py       |  71 +++++++-
+ vllm_ascend/model_loader/rfork/config.py      |  21 +++
+ .../model_loader/rfork/planner_client.py      |  46 +++--
+ 6 files changed, 301 insertions(+), 20 deletions(-)
+ create mode 100644 tests/ut/model_loader/rfork/test_model_identity_headers.py
+
+diff --git a/docs/source/user_guide/feature_guide/rfork.md b/docs/source/user_guide/feature_guide/rfork.md
+index 1dad8e47c..1686376e2 100644
+--- a/docs/source/user_guide/feature_guide/rfork.md
++++ b/docs/source/user_guide/feature_guide/rfork.md
+@@ -47,6 +47,7 @@ To enable RFork, pass `--load-format rfork` and provide RFork settings through `
+ | **rfork_scheduler_url** | String | Base URL of the planner service used for seed allocation, release, and heartbeat. | Required for planner-based matching. Example: `http://127.0.0.1:1223`. |
+ | **rfork_seed_timeout_sec** | Number | Timeout for waiting until the local seed HTTP service becomes healthy after startup. | Optional. Default: `5.0`. Must be greater than `0`. Invalid values fall back to the default. |
+ | **rfork_request_timeout_sec** | Number | HTTP connect/read timeout for planner and seed requests. | Optional. Default: `10.0`. Must be greater than `0`. |
++| **rfork_model_identity_headers** | Boolean | Attach readable model identity headers to every planner request. | Optional. Default: `false`. Explicit JSON `true` or `false` overrides `RFORK_MODEL_IDENTITY_HEADERS`; otherwise the environment variable accepts `0`, `1`, `true`, or `false`, ignoring case and surrounding whitespace. |
+ | **rfork_heartbeat_interval_sec** | Number | Interval between planner heartbeat reports. | Optional. Default: `30.0`. JSON configuration only. |
+ | **rfork_lease_release_max_attempts** | Integer | Fast-attempt count before transient lease-release failures continue at a slower background interval. | Optional. Default: `3`. Permanent planner rejection still stops retries. |
+ | **rfork_lease_release_retry_interval_sec** | Number | Interval between fast lease-release retries. | Optional. Default: `30.0`. JSON configuration only. |
+@@ -63,6 +64,26 @@ the seed HTTP ports and the HIXL endpoint range. The HIXL data-plane endpoints d
+ (`YR_TE_HIXL_BASE_PORT`, 100 ports per physical device), which stays clear of Mooncake ADXL's default `20000`-based
+ segments on nodes that co-locate both engines.
+ 
++### Optional Planner Model Identity Headers
++
++Set `"rfork_model_identity_headers": true` in `--model-loader-extra-config`, or set `RFORK_MODEL_IDENTITY_HEADERS=1` in the vLLM worker environment, to attach readable model metadata to every RFork planner request (`/get_seed`, `/put_seed`, `/renew_seed_lease`, `/remove_seed`, and `/add_seed`). RFork resolves this switch when constructing its configuration, with the following priority:
++
++1. An explicit `rfork_model_identity_headers` JSON boolean (`true` or `false`). Other JSON types fail configuration initialization.
++2. The `RFORK_MODEL_IDENTITY_HEADERS` environment variable: `1` or `true` enables the headers; `0` or `false` disables them. Values are case-insensitive and surrounding whitespace is ignored. Other values, including empty or whitespace-only values, fail configuration initialization when no JSON override is supplied.
++3. The default, `false` (disabled).
++
++An explicit JSON `false` disables the headers even when the environment variable is `1`.
++
++When the headers are enabled, `model_url` and `model_deploy_strategy_name` must contain only ASCII characters. Non-ASCII values fail configuration initialization with an error naming the field. This restriction does not apply when the headers are disabled.
++
++| HTTP Header | Value |
++| ----------- | ----- |
++| `MODEL_URL` | The resolved RFork `model_url`. |
++| `DEPLOY_STRATEGY` | The resolved RFork `model_deploy_strategy_name`. |
++| `IS_DRAFT` | `true` for a draft model, otherwise `false`. |
++
++The switch is not sensitive, but enabling it sends model identifiers in plain text. Values must be valid HTTP header text; avoid model URLs containing credentials. The existing seed key and request headers are preserved. A planner must read the additional headers to use or display this metadata.
++
+ ### How RFork Matches Seeds
+ 
+ RFork does not match instances by `model_url` alone. The local seed key is derived from three layers:
+diff --git a/tests/ut/model_loader/rfork/test_identity_validation.py b/tests/ut/model_loader/rfork/test_identity_validation.py
+index ced510f6b..7dcece4f5 100644
+--- a/tests/ut/model_loader/rfork/test_identity_validation.py
++++ b/tests/ut/model_loader/rfork/test_identity_validation.py
+@@ -974,6 +974,7 @@ def test_planner_rejects_invalid_lease_headers_with_error(
+         planner_url="http://planner",
+         model_url="model",
+         model_deploy_strategy_name="strategy",
++        send_model_identity_headers=False,
+         lease_release_max_attempts=1,
+         lease_release_retry_interval_sec=1.0,
+         heartbeat_interval_sec=1.0,
+@@ -1006,6 +1007,7 @@ def test_planner_seed_key_requires_bound_structural_digest(planner_module, monke
+         planner_url="http://planner",
+         model_url="model",
+         model_deploy_strategy_name="strategy",
++        send_model_identity_headers=False,
+     )
+     identity = SimpleNamespace(
+         tp_rank=0, pp_rank=None, ep_rank=None, is_draft_model=False, compatibility_fingerprint="fp"
+@@ -1040,6 +1042,7 @@ def test_planner_verify_structural_digest_binds_and_reports_drift(planner_module
+         planner_url="http://planner",
+         model_url="model",
+         model_deploy_strategy_name="strategy",
++        send_model_identity_headers=False,
+     )
+     identity = SimpleNamespace(
+         tp_rank=0, pp_rank=None, ep_rank=None, is_draft_model=False, compatibility_fingerprint="fp"
+@@ -1063,6 +1066,7 @@ def test_planner_acquires_and_renews_a_ttl_lease(planner_module, monkeypatch):
+         planner_url="http://planner",
+         model_url="model",
+         model_deploy_strategy_name="strategy",
++        send_model_identity_headers=False,
+     )
+     identity = SimpleNamespace(
+         tp_rank=0, pp_rank=None, ep_rank=None, is_draft_model=False, compatibility_fingerprint="fp"
+diff --git a/tests/ut/model_loader/rfork/test_model_identity_headers.py b/tests/ut/model_loader/rfork/test_model_identity_headers.py
+new file mode 100644
+index 000000000..f854fd969
+--- /dev/null
++++ b/tests/ut/model_loader/rfork/test_model_identity_headers.py
+@@ -0,0 +1,158 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++"""Tests for RFork's opt-in model identity request headers."""
++
++import pytest
++
++from .rfork_test_support import _load_module
++
++
++def _config(monkeypatch, extra_config=None):
++    config = _load_module(monkeypatch, "rfork_test_model_identity_config", "config.py")
++    raw_config = {
++        "model_url": "model",
++        "model_deploy_strategy_name": "strategy",
++        "rfork_scheduler_url": "http://planner",
++    }
++    if extra_config is not None:
++        raw_config.update(extra_config)
++    return config.RForkConfig.from_extra_config(raw_config)
++
++
++@pytest.mark.parametrize(
++    ("env_value", "expected"),
++    [
++        (None, False),
++        ("0", False),
++        ("1", True),
++        ("false", False),
++        ("true", True),
++        ("FALSE", False),
++        ("True", True),
++        (" 0 ", False),
++        (" 1 ", True),
++        (" false ", False),
++        (" TRUE ", True),
++    ],
++    ids=[
++        "unset",
++        "zero",
++        "one",
++        "false",
++        "true",
++        "uppercase-false",
++        "mixed-case-true",
++        "spaced-zero",
++        "spaced-one",
++        "spaced-false",
++        "spaced-true",
++    ],
++)
++def test_model_identity_header_switch_reads_rfork_environment(monkeypatch, env_value, expected):
++    if env_value is None:
++        monkeypatch.delenv("RFORK_MODEL_IDENTITY_HEADERS", raising=False)
++    else:
++        monkeypatch.setenv("RFORK_MODEL_IDENTITY_HEADERS", env_value)
++
++    cfg = _config(monkeypatch)
++
++    assert cfg.send_model_identity_headers is expected
++
++
++@pytest.mark.parametrize("env_value", ["", "   ", "2", "yes", "no", "true!"])
++def test_model_identity_header_switch_rejects_invalid_values(monkeypatch, env_value):
++    monkeypatch.setenv("RFORK_MODEL_IDENTITY_HEADERS", env_value)
++
++    with pytest.raises(
++        ValueError,
++        match="RFORK_MODEL_IDENTITY_HEADERS must be '0', '1', 'true' or 'false'",
++    ):
++        _config(monkeypatch)
++
++
++@pytest.mark.parametrize("json_value, expected", [(True, True), (False, False)])
++def test_model_identity_header_switch_accepts_json_boolean(monkeypatch, json_value, expected):
++    monkeypatch.delenv("RFORK_MODEL_IDENTITY_HEADERS", raising=False)
++
++    cfg = _config(monkeypatch, {"rfork_model_identity_headers": json_value})
++
++    assert cfg.send_model_identity_headers is expected
++
++
++@pytest.mark.parametrize(
++    "json_value, env_value, expected",
++    [
++        (True, "0", True),
++        (True, "false", True),
++        (False, "1", False),
++        (False, "true", False),
++    ],
++)
++def test_json_switch_takes_precedence_over_environment(monkeypatch, json_value, env_value, expected):
++    monkeypatch.setenv("RFORK_MODEL_IDENTITY_HEADERS", env_value)
++
++    cfg = _config(monkeypatch, {"rfork_model_identity_headers": json_value})
++
++    assert cfg.send_model_identity_headers is expected
++
++
++@pytest.mark.parametrize("json_value", [None, 0, 1, "true", "", [], {}])
++def test_model_identity_header_switch_rejects_non_boolean_json(monkeypatch, json_value):
++    monkeypatch.delenv("RFORK_MODEL_IDENTITY_HEADERS", raising=False)
++
++    with pytest.raises(ValueError, match="rfork_model_identity_headers must be a JSON boolean"):
++        _config(monkeypatch, {"rfork_model_identity_headers": json_value})
++
++
++@pytest.mark.parametrize("json_value, env_value", [(True, ""), (False, "invalid")])
++def test_valid_json_switch_overrides_invalid_environment(monkeypatch, json_value, env_value):
++    monkeypatch.setenv("RFORK_MODEL_IDENTITY_HEADERS", env_value)
++
++    cfg = _config(monkeypatch, {"rfork_model_identity_headers": json_value})
++
++    assert cfg.send_model_identity_headers is json_value
++
++
++def test_existing_config_does_not_change_when_environment_changes(monkeypatch):
++    monkeypatch.setenv("RFORK_MODEL_IDENTITY_HEADERS", "0")
++    cfg = _config(monkeypatch)
++
++    monkeypatch.setenv("RFORK_MODEL_IDENTITY_HEADERS", "1")
++
++    assert cfg.send_model_identity_headers is False
++
++
++@pytest.mark.parametrize("field", ["model_url", "model_deploy_strategy_name"])
++@pytest.mark.parametrize("switch_source", ["json", "environment"])
++def test_identity_headers_reject_non_ascii_metadata_at_initialization(monkeypatch, field, switch_source):
++    monkeypatch.setenv("RFORK_MODEL_IDENTITY_HEADERS", "1" if switch_source == "environment" else "0")
++    extra_config: dict[str, str | bool] = {field: "model/部署A"}
++    if switch_source == "json":
++        extra_config["rfork_model_identity_headers"] = True
++
++    with pytest.raises(ValueError, match=f"{field} must contain only ASCII characters"):
++        _config(monkeypatch, extra_config)
++
++
++@pytest.mark.parametrize("field", ["model_url", "model_deploy_strategy_name"])
++def test_disabled_identity_headers_allow_non_ascii_metadata(monkeypatch, field):
++    monkeypatch.setenv("RFORK_MODEL_IDENTITY_HEADERS", "1")
++
++    cfg = _config(monkeypatch, {field: "model/部署A", "rfork_model_identity_headers": False})
++
++    assert getattr(cfg, field) == "model/部署A"
++
++
++def test_enabled_identity_headers_accept_ascii_metadata(monkeypatch):
++    cfg = _config(
++        monkeypatch,
++        {
++            "model_url": "/models/Qwen-3",
++            "model_deploy_strategy_name": "deployment_tp8",
++            "rfork_model_identity_headers": True,
++        },
++    )
++
++    assert cfg.model_url == "/models/Qwen-3"
++    assert cfg.model_deploy_strategy_name == "deployment_tp8"
+diff --git a/tests/ut/model_loader/rfork/test_planner_http_contract.py b/tests/ut/model_loader/rfork/test_planner_http_contract.py
+index 24c6e7a4a..1d6427a25 100644
+--- a/tests/ut/model_loader/rfork/test_planner_http_contract.py
++++ b/tests/ut/model_loader/rfork/test_planner_http_contract.py
+@@ -3,6 +3,7 @@
+ 
+ """Exercise the real client and planner routes without running a network server."""
+ 
++from dataclasses import replace
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -36,12 +37,14 @@ class _PlannerTransport:
+             (route.path, verb): route.endpoint for route in build_router(store).routes for verb in route.methods
+         }
+         self.calls: list[tuple[str, str]] = []
++        self.request_headers: list[dict[str, str]] = []
+ 
+     def _dispatch(self, method, url, headers=None, timeout=None, allow_redirects=None):
+         assert url.startswith(self.planner_url), url
+         path = url[len(self.planner_url) :]
+         assert timeout is not None, "the client must always bound its planner requests"
+         self.calls.append((method, path))
++        self.request_headers.append(dict(headers or {}))
+         assert path in {route_path for route_path, _ in self.routes}, f"client called an unknown planner route: {path}"
+         endpoint = self.routes.get((path, method))
+         assert endpoint is not None, f"planner has no {method} handler for {path}"
+@@ -56,8 +59,13 @@ class _PlannerTransport:
+         return self._dispatch("POST", url, **kwargs)
+ 
+ 
+-@pytest.fixture
+-def planner_http(runtime, monkeypatch):
++def _make_planner_http(
++    runtime,
++    monkeypatch,
++    *,
++    send_model_identity_headers: bool = False,
++    is_draft_model: bool = False,
++):
+     clock = SimpleNamespace(now=0.0)
+     store = Store(
+         heartbeat_ttl_sec=LEASE_TTL_SEC * 2,
+@@ -69,7 +77,9 @@ def planner_http(runtime, monkeypatch):
+     transport = _PlannerTransport(store)
+     monkeypatch.setattr(runtime.client, "requests", transport)
+     monkeypatch.setattr(runtime.client, "SEED_REMOVAL_RETRY_BACKOFF_SEC", 0)
+-    client = runtime.client.RForkPlannerClient(runtime.config, runtime.identity)
++    config = replace(runtime.config, send_model_identity_headers=send_model_identity_headers)
++    identity = replace(runtime.identity, is_draft_model=is_draft_model)
++    client = runtime.client.RForkPlannerClient(config, identity)
+     client.bind_structural_digest("digest")
+     return SimpleNamespace(
+         clock=clock,
+@@ -80,12 +90,27 @@ def planner_http(runtime, monkeypatch):
+     )
+ 
+ 
++@pytest.fixture
++def planner_http(runtime, monkeypatch):
++    return _make_planner_http(runtime, monkeypatch)
++
++
+ def _advertise(planner_http, port=1234):
+     result = planner_http.client.report_seed_once(port, seed_ip="127.0.0.1")
+     assert result.status.name == "ACCEPTED"
+ 
+ 
+-def test_full_seed_lifecycle_over_the_real_planner_routes(planner_http):
++@pytest.mark.parametrize("send_model_identity_headers", [False, True])
++@pytest.mark.parametrize("is_draft_model", [False, True])
++def test_full_seed_lifecycle_over_the_real_planner_routes(
++    runtime, monkeypatch, send_model_identity_headers, is_draft_model
++):
++    planner_http = _make_planner_http(
++        runtime,
++        monkeypatch,
++        send_model_identity_headers=send_model_identity_headers,
++        is_draft_model=is_draft_model,
++    )
+     client = planner_http.client
+ 
+     # Advertise, then lease the seed back through the planner.
+@@ -109,6 +134,44 @@ def test_full_seed_lifecycle_over_the_real_planner_routes(planner_http):
+         "/put_seed",
+         "/remove_seed",
+     ]
++    expected_identity_headers = {
++        "MODEL_URL": "model",
++        "DEPLOY_STRATEGY": "strategy",
++        "IS_DRAFT": str(is_draft_model).lower(),
++    }
++    expected_original_headers = {
++        "/add_seed": {
++            "SEED_KEY": client.seed_key,
++            "SEED_IP": "127.0.0.1",
++            "SEED_PORT": "1234",
++            "SEED_RANK": "0",
++            "SEED_REFCNT": "0",
++        },
++        "/get_seed": {"SEED_KEY": client.seed_key},
++        "/renew_seed_lease": {
++            "SEED_IP": "127.0.0.1",
++            "SEED_PORT": "1234",
++            "USER_ID": lease.user_id,
++            "SEED_RANK": "0",
++        },
++        "/put_seed": {
++            "SEED_IP": "127.0.0.1",
++            "SEED_PORT": "1234",
++            "USER_ID": lease.user_id,
++            "SEED_RANK": "0",
++        },
++        "/remove_seed": {
++            "SEED_KEY": client.seed_key,
++            "SEED_IP": "127.0.0.1",
++            "SEED_PORT": "1234",
++            "SEED_RANK": "0",
++        },
++    }
++    for (_, path), headers in zip(planner_http.transport.calls, planner_http.transport.request_headers):
++        expected_headers = expected_original_headers[path]
++        if send_model_identity_headers:
++            expected_headers = {**expected_headers, **expected_identity_headers}
++        assert headers == expected_headers
+     assert planner_http.store.debug_snapshot()["seed_count"] == 0
+ 
+ 
+diff --git a/vllm_ascend/model_loader/rfork/config.py b/vllm_ascend/model_loader/rfork/config.py
+index cabd87f9d..edbc3a644 100644
+--- a/vllm_ascend/model_loader/rfork/config.py
++++ b/vllm_ascend/model_loader/rfork/config.py
+@@ -63,6 +63,7 @@ class RForkConfig:
+     heartbeat_interval_sec: float = DEFAULT_RFORK_HEARTBEAT_INTERVAL_SEC
+     lease_release_max_attempts: int = DEFAULT_RFORK_LEASE_RELEASE_MAX_ATTEMPTS
+     lease_release_retry_interval_sec: float = DEFAULT_RFORK_LEASE_RELEASE_RETRY_INTERVAL_SEC
++    send_model_identity_headers: bool = False
+ 
+     def __post_init__(self) -> None:
+         # Operational settings are JSON-only; reject typos instead of using similar environment variables.
+@@ -76,6 +77,14 @@ class RForkConfig:
+         port_base = self.seed_port_base
+         if isinstance(port_base, bool) or not isinstance(port_base, int) or port_base < 0 or port_base > 65535:
+             raise ValueError("rfork_seed_port_base must be a JSON integer in range [0, 65535]")
++        if not isinstance(self.send_model_identity_headers, bool):
++            raise ValueError("rfork_model_identity_headers must be a JSON boolean")
++        if self.send_model_identity_headers:
++            for name in ("model_url", "model_deploy_strategy_name"):
++                if not getattr(self, name).isascii():
++                    raise ValueError(
++                        f"{name} must contain only ASCII characters when rfork_model_identity_headers is enabled"
++                    )
+ 
+     @classmethod
+     def from_extra_config(cls, raw_config: object) -> "RForkConfig":
+@@ -86,7 +95,19 @@ class RForkConfig:
+         else:
+             raise RuntimeError("RFork requires --model-loader-extra-config to be a JSON object.")
+ 
++        # Explicit JSON configuration takes priority over the RFork-owned switch.
++        # Environment default: 0; valid values: 0, 1, true or false (case-insensitive).
++        # The switch is not sensitive; emitted model metadata may be sensitive.
++        if "rfork_model_identity_headers" in config:
++            send_model_identity_headers = config["rfork_model_identity_headers"]
++        else:
++            model_identity_headers = os.getenv("RFORK_MODEL_IDENTITY_HEADERS", "0").strip().lower()
++            if model_identity_headers not in {"0", "1", "true", "false"}:
++                raise ValueError("RFORK_MODEL_IDENTITY_HEADERS must be '0', '1', 'true' or 'false'")
++            send_model_identity_headers = model_identity_headers in {"1", "true"}
++
+         return cls(
++            send_model_identity_headers=send_model_identity_headers,
+             heartbeat_interval_sec=config.get("rfork_heartbeat_interval_sec", DEFAULT_RFORK_HEARTBEAT_INTERVAL_SEC),
+             lease_release_max_attempts=config.get(
+                 "rfork_lease_release_max_attempts", DEFAULT_RFORK_LEASE_RELEASE_MAX_ATTEMPTS
+diff --git a/vllm_ascend/model_loader/rfork/planner_client.py b/vllm_ascend/model_loader/rfork/planner_client.py
+index 16b4b8f2d..110ea3945 100644
+--- a/vllm_ascend/model_loader/rfork/planner_client.py
++++ b/vllm_ascend/model_loader/rfork/planner_client.py
+@@ -114,12 +114,22 @@ class RForkPlannerClient:
+                 "rfork_scheduler_url is not set. Configure it through model_loader_extra_config or RFORK_SCHEDULER_URL."
+             )
+ 
++    def _with_model_identity_headers(self, headers: dict[str, str]) -> dict[str, str]:
++        if not self.config.send_model_identity_headers:
++            return headers
++        return {
++            **headers,
++            "MODEL_URL": self.config.model_url,
++            "DEPLOY_STRATEGY": self.config.model_deploy_strategy_name,
++            "IS_DRAFT": str(self._is_draft_model).lower(),
++        }
++
+     def acquire_seed(self) -> SeedLease | None:
+         try:
+             self._require_planner()
+             response = requests.get(
+                 f"{self.planner_url}/get_seed",
+-                headers={"SEED_KEY": self.seed_key},
++                headers=self._with_model_identity_headers({"SEED_KEY": self.seed_key}),
+                 timeout=self.request_timeout_sec,
+                 allow_redirects=False,
+             )
+@@ -183,7 +193,7 @@ class RForkPlannerClient:
+         try:
+             response = requests.post(
+                 f"{self.planner_url}/put_seed",
+-                headers=headers,
++                headers=self._with_model_identity_headers(headers),
+                 timeout=self.request_timeout_sec,
+                 allow_redirects=False,
+             )
+@@ -220,12 +230,14 @@ class RForkPlannerClient:
+             self._require_planner()
+             response = requests.post(
+                 f"{self.planner_url}/renew_seed_lease",
+-                headers={
+-                    "SEED_IP": lease.seed_ip,
+-                    "SEED_PORT": str(lease.seed_port),
+-                    "USER_ID": lease.user_id,
+-                    "SEED_RANK": str(lease.seed_rank),
+-                },
++                headers=self._with_model_identity_headers(
++                    {
++                        "SEED_IP": lease.seed_ip,
++                        "SEED_PORT": str(lease.seed_port),
++                        "USER_ID": lease.user_id,
++                        "SEED_RANK": str(lease.seed_rank),
++                    }
++                ),
+                 timeout=self.request_timeout_sec,
+                 allow_redirects=False,
+             )
+@@ -266,7 +278,7 @@ class RForkPlannerClient:
+             try:
+                 response = requests.post(
+                     f"{self.planner_url}/remove_seed",
+-                    headers=headers,
++                    headers=self._with_model_identity_headers(headers),
+                     timeout=self.request_timeout_sec,
+                 )
+                 if response.status_code in (200, 404):
+@@ -300,13 +312,15 @@ class RForkPlannerClient:
+                 self.last_advertisement = advertisement
+             response = requests.post(
+                 f"{self.planner_url}/add_seed",
+-                headers={
+-                    "SEED_KEY": self.seed_key,
+-                    "SEED_IP": advertisement.seed_ip,
+-                    "SEED_PORT": str(advertisement.seed_port),
+-                    "SEED_RANK": str(advertisement.seed_rank),
+-                    "SEED_REFCNT": "0",
+-                },
++                headers=self._with_model_identity_headers(
++                    {
++                        "SEED_KEY": self.seed_key,
++                        "SEED_IP": advertisement.seed_ip,
++                        "SEED_PORT": str(advertisement.seed_port),
++                        "SEED_RANK": str(advertisement.seed_rank),
++                        "SEED_REFCNT": "0",
++                    }
++                ),
+                 timeout=self.request_timeout_sec,
+                 allow_redirects=False,
+             )
+-- 
+2.54.0
+

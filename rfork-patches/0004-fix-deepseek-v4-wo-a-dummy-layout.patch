@@ -1,0 +1,71 @@
+Subject: [PATCH 4/5] fix(model): align DeepSeek V4 wo_a layout after dummy loading
+
+Backport the wo_a layout part of vllm-ascend PR #16485 to v0.26.0rc1.
+Move the 2D-to-3D conversion from weight_loader to
+process_weights_after_loading so dummy and checkpoint loading produce the
+same registered tensor structure. Cover the dummy path with a regression
+test.
+
+Upstream: https://github.com/vllm-project/vllm-ascend/pull/16485
+
+---
+diff --git a/tests/ut/ops/test_linear.py b/tests/ut/ops/test_linear.py
+index 2c0ab4b8e..5b7280188 100644
+--- a/tests/ut/ops/test_linear.py
++++ b/tests/ut/ops/test_linear.py
+@@ -13,6 +13,7 @@ from vllm_ascend.ops.linear import (
+     AscendRowParallelLinear,
+     AscendUnquantizedLinearMethod,
+ )
++from vllm_ascend.utils import AscendDeviceType
+ 
+ 
+ class BaseLinearTest(unittest.TestCase):
+@@ -60,6 +61,20 @@ class TestAscendUnquantizedLinearMethod(TestBase):
+         type(self.layer.weight.data).is_meta = mock_is_meta
+         self.layer.precast_fp32_weight = False
+ 
++    @patch("vllm_ascend.ops.linear.get_ascend_device_type", return_value=AscendDeviceType.A3)
++    @patch("vllm_ascend.ops.linear.maybe_trans_nz", side_effect=lambda weight: weight)
++    def test_dummy_wo_a_reshape_matches_loaded_layout(self, _mock_trans_nz, _mock_device_type):
++        self.layer.prefix = "model.layers.0.mlp.wo_a"
++        self.layer.n_local_groups = 2
++        self.layer.o_lora_rank = 2
++        self.layer.weight = torch.nn.Parameter(torch.arange(24, dtype=torch.bfloat16).reshape(4, 6))
++
++        with patch("vllm_ascend.ops.linear.UnquantizedLinearMethod.process_weights_after_loading"):
++            self.method.process_weights_after_loading(self.layer)
++            self.assertEqual(tuple(self.layer.weight.data.shape), (2, 6, 2))
++            self.method.process_weights_after_loading(self.layer)
++            self.assertEqual(tuple(self.layer.weight.data.shape), (2, 6, 2))
++
+     @patch("vllm_ascend.utils.get_ascend_config")
+     @mock.patch("torch_npu.npu_format_cast")
+     def test_process_weights_after_loading_with_nz0(self, mock_format_cast, mock_get_config):
+diff --git a/vllm_ascend/ops/linear.py b/vllm_ascend/ops/linear.py
+index 4f5860589..c71c83f44 100644
+--- a/vllm_ascend/ops/linear.py
++++ b/vllm_ascend/ops/linear.py
+@@ -96,6 +96,12 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
+             # shared_expert_gate in ND format, leaving non-310P policy intact.
+             if not keep_nd_weight:
+                 layer.weight.data = maybe_trans_nz(layer.weight.data)
++        # Dummy loading skips weight_loader, so reshape wo_a in the shared
++        # post-load path before RFork records the model's tensor layout.
++        if "wo_a" in layer.prefix and get_ascend_device_type() != AscendDeviceType.A5 and layer.weight.ndim == 2:
++            layer.weight.data = (
++                layer.weight.data.view(layer.n_local_groups, layer.o_lora_rank, -1).transpose(2, 1).contiguous()
++            )
+ 
+     def apply(
+         self,
+@@ -480,9 +486,6 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
+         if "wo_a" in self.prefix and get_ascend_device_type() != AscendDeviceType.A5:
+             if self.weight.ndim == 2:
+                 super().weight_loader(param, loaded_weight)
+-                self.weight.data = (
+-                    self.weight.data.view(self.n_local_groups, self.o_lora_rank, -1).transpose(2, 1).contiguous()
+-                )
+             else:
+                 # In RL update flows, wo_a can be loaded again after being
+                 # transformed into [n_local_groups, hidden_size, o_lora_rank].

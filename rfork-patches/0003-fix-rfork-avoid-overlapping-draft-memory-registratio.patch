@@ -1,0 +1,818 @@
+From 395a59cba61377e40327bee2a2ce5a605f306500 Mon Sep 17 00:00:00 2001
+From: yangsonglin13 <yangsonglin566@gmail.com>
+Date: Thu, 3 Sep 2026 21:51:45 +0800
+Subject: [PATCH 3/4] fix(rfork): avoid overlapping draft memory registration
+
+Exclude target-model weight regions when registering RFork draft weights so HCCL does not reject overlapping device memory. Keep seed manifests and receiver transfers aligned, and cover the draft worker propagation and interval handling with unit tests.
+
+Signed-off-by: yangsonglin13 <yangsonglin566@gmail.com>
+---
+ .../model_loader/rfork/test_rfork_loader.py   | 148 +++++++++-
+ .../rfork/test_transfer_backend.py            | 271 ++++++++++++++++++
+ .../model_loader/rfork/rfork_loader.py        |  24 +-
+ .../model_loader/rfork/rfork_worker.py        |  17 +-
+ .../model_loader/rfork/transfer_backend.py    | 143 +++++++--
+ 5 files changed, 575 insertions(+), 28 deletions(-)
+
+diff --git a/tests/ut/model_loader/rfork/test_rfork_loader.py b/tests/ut/model_loader/rfork/test_rfork_loader.py
+index 408f11a8a..85f67b71d 100644
+--- a/tests/ut/model_loader/rfork/test_rfork_loader.py
++++ b/tests/ut/model_loader/rfork/test_rfork_loader.py
+@@ -16,6 +16,7 @@
+ 
+ from functools import wraps
+ from types import SimpleNamespace
++from typing import Any
+ 
+ import pytest
+ import torch
+@@ -32,6 +33,7 @@ from vllm_ascend.model_loader.rfork.rfork_loader import (
+     _rfork_pre_transfer_weight_processing,
+     _rfork_skip_unquantized_moe_post_load_processing,
+ )
++from vllm_ascend.model_loader.rfork.rfork_worker import RForkWorker
+ from vllm_ascend.model_loader.rfork.seed_protocol import get_local_seed_key
+ 
+ 
+@@ -41,6 +43,8 @@ class DummyLoadConfig:
+ 
+     def __init__(self, model_loader_extra_config):
+         self.model_loader_extra_config = model_loader_extra_config
++        self.rfork_worker: Any = None
++        self.rfork_draft_worker: Any = None
+ 
+ 
+ @pytest.mark.parametrize("config_value", [True, False])
+@@ -297,6 +301,144 @@ def test_rfork_worker_receives_parallel_ranks(monkeypatch):
+     assert captured["device_id"] == 11
+ 
+ 
++def test_rfork_worker_set_excluded_weight_blocks_normalizes_input():
++    worker = RForkWorker.__new__(RForkWorker)
++
++    worker.set_excluded_weight_blocks([(128, 4096)])
++    assert worker._excluded_weight_blocks == [(128, 4096)]
++
++    worker.set_excluded_weight_blocks(None)
++    assert worker._excluded_weight_blocks == []
++
++
++def test_rfork_worker_pre_transfer_forwards_excluded_blocks():
++    worker: Any = RForkWorker.__new__(RForkWorker)
++    forwarded_blocks = []
++    worker.device_id = 0
++    worker.ready_to_start_seed_service = False
++    worker._excluded_weight_blocks = [(128, 4096)]
++
++    def register_memory_region(model, processed_layout, blocks):
++        forwarded_blocks.append(blocks)
++        return True
++
++    worker.transfer_backend = SimpleNamespace(
++        is_initialized=lambda: True,
++        register_memory_region=register_memory_region,
++    )
++
++    assert worker.pre_transfer(object(), False)
++    assert forwarded_blocks == [[(128, 4096)]]
++    assert worker.ready_to_start_seed_service
++
++
++def test_rfork_target_registered_blocks_not_collected_for_target_model():
++    load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
++    loader = RForkModelLoader(load_config)
++    load_config.rfork_worker = SimpleNamespace(transfer_backend=SimpleNamespace(registered_weight_blocks=[(128, 4096)]))
++    target_model_config = SimpleNamespace()
++    vllm_config = _vllm_config(model_config=target_model_config)
++
++    assert loader._get_target_registered_blocks(vllm_config, target_model_config) == []
++
++
++def test_rfork_target_registered_blocks_collected_for_draft_model():
++    load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
++    loader = RForkModelLoader(load_config)
++    draft_model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5_mtp"))
++    target_blocks = [(128, 4096), (8192, 1024)]
++    load_config.rfork_worker = SimpleNamespace(transfer_backend=SimpleNamespace(registered_weight_blocks=target_blocks))
++    vllm_config = _vllm_config(model_config=draft_model_config)
++
++    blocks = loader._get_target_registered_blocks(vllm_config, draft_model_config)
++
++    assert blocks == target_blocks
++    assert blocks is not target_blocks
++
++
++def test_rfork_target_registered_blocks_empty_without_target_worker():
++    load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
++    loader = RForkModelLoader(load_config)
++    draft_model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5_mtp"))
++    vllm_config = _vllm_config(model_config=draft_model_config)
++
++    assert loader._get_target_registered_blocks(vllm_config, draft_model_config) == []
++
++
++def _make_reset_transfer_state_worker(unregister_result):
++    worker: Any = RForkWorker.__new__(RForkWorker)
++    worker.device_id = 0
++    worker.ready_to_start_seed_service = True
++    worker.transfer_backend = SimpleNamespace(unregister_memory_region=lambda: unregister_result)
++    return worker
++
++
++def test_reset_transfer_state_propagates_unregister_result():
++    worker = _make_reset_transfer_state_worker(False)
++
++    assert not worker.reset_transfer_state()
++    assert worker.ready_to_start_seed_service is False
++
++    worker = _make_reset_transfer_state_worker(True)
++
++    assert worker.reset_transfer_state()
++    assert worker.ready_to_start_seed_service is False
++
++
++def test_reset_transfer_state_survives_backend_exception():
++    worker: Any = RForkWorker.__new__(RForkWorker)
++    worker.device_id = 0
++    worker.ready_to_start_seed_service = True
++
++    def raise_error():
++        raise RuntimeError("engine down")
++
++    worker.transfer_backend = SimpleNamespace(unregister_memory_region=raise_error)
++
++    assert not worker.reset_transfer_state()
++    assert worker.ready_to_start_seed_service is False
++
++
++def test_rfork_draft_load_passes_target_registered_blocks_to_worker(monkeypatch):
++    import vllm.model_executor.model_loader as model_loader
++
++    load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
++    loader = RForkModelLoader(load_config)
++    draft_model_config = SimpleNamespace(
++        dtype=torch.float32,
++        model="/models/test",
++        hf_config=SimpleNamespace(model_type="qwen3_5_mtp"),
++    )
++    vllm_config = _vllm_config(model_config=draft_model_config)
++    target_blocks = [(128, 4096)]
++    load_config.rfork_worker = SimpleNamespace(transfer_backend=SimpleNamespace(registered_weight_blocks=target_blocks))
++    captured_blocks = []
++    draft_worker = SimpleNamespace(
++        is_seed_available=lambda: False,
++        set_excluded_weight_blocks=lambda blocks: captured_blocks.append(list(blocks)),
++        post_transfer=lambda: True,
++        reset_transfer_state=lambda: True,
++        start_seed_service=lambda model, processed_layout: None,
++    )
++    load_config.rfork_draft_worker = draft_worker
++
++    expected_model = SimpleNamespace()
++
++    def fake_get_model(**kwargs):
++        return expected_model
++
++    monkeypatch.setattr(model_loader, "get_model", fake_get_model)
++    monkeypatch.setattr(
++        "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
++        lambda: SimpleNamespace(eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None)),
++    )
++
++    model = loader.load_model(vllm_config=vllm_config, model_config=draft_model_config)
++
++    assert model is expected_model
++    assert captured_blocks == [target_blocks]
++
++
+ @pytest.mark.parametrize(
+     "model_config",
+     [
+@@ -539,10 +681,11 @@ def test_rfork_fallback_clears_only_failed_model_state_before_reinit(monkeypatch
+ 
+     rfork_worker = SimpleNamespace(
+         is_seed_available=lambda: True,
++        set_excluded_weight_blocks=lambda blocks: None,
+         pre_transfer=lambda model, processed_layout: True,
+         transfer=lambda model, processed_layout: False,
+         post_transfer=lambda: True,
+-        reset_transfer_state=lambda: None,
++        reset_transfer_state=lambda: True,
+         start_seed_service=lambda model, processed_layout: None,
+     )
+ 
+@@ -598,8 +741,9 @@ def test_rfork_seed_miss_fallback_preserves_existing_process_global_state(monkey
+ 
+     rfork_worker = SimpleNamespace(
+         is_seed_available=lambda: False,
++        set_excluded_weight_blocks=lambda blocks: None,
+         post_transfer=lambda: True,
+-        reset_transfer_state=lambda: None,
++        reset_transfer_state=lambda: True,
+         start_seed_service=lambda model, processed_layout: None,
+     )
+ 
+diff --git a/tests/ut/model_loader/rfork/test_transfer_backend.py b/tests/ut/model_loader/rfork/test_transfer_backend.py
+index a5dd2a80f..9defe1554 100644
+--- a/tests/ut/model_loader/rfork/test_transfer_backend.py
++++ b/tests/ut/model_loader/rfork/test_transfer_backend.py
+@@ -27,6 +27,8 @@ from vllm_ascend.model_loader.rfork.transfer_backend import (
+     _collect_processed_layout_tensors,
+     _parse_weight_info,
+     _reshape_tensor_to_seed_shape,
++    _split_tensors_by_excluded_blocks,
++    _subtract_weight_blocks,
+     get_remote_instance_transfer_engine_info,
+ )
+ 
+@@ -159,6 +161,72 @@ def test_unregister_memory_region_releases_registered_tensor_owners():
+     assert backend.registered_weight_blocks == []
+ 
+ 
++def test_unregister_memory_region_keeps_tracking_when_engine_fails():
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend.rfork_transfer_engine = SimpleNamespace(
++        batch_unregister_memory=lambda *args: SimpleNamespace(
++            is_error=lambda: True, to_string=lambda: "mock unregister error"
++        )
++    )
++    stale_blocks = [(4096, 128)]
++    backend.registered_weight_blocks = list(stale_blocks)
++    backend.rfork_transfer_engine_weights_info_dict = {"weight": (4096, 128, 2)}
++    backend.rfork_transfer_engine_weights_shape_dict = {"weight": (64,)}
++    backend._registered_transferable_tensors = []
++
++    assert not backend.unregister_memory_region()
++    assert backend.registered_weight_blocks == stale_blocks
++    assert backend.rfork_transfer_engine_weights_info_dict is not None
++    assert backend.rfork_transfer_engine_weights_shape_dict is not None
++
++
++def test_register_memory_region_retries_stale_blocks_before_registering(monkeypatch):
++    storage = torch.arange(10, dtype=torch.float32)
++    stale_blocks = [(storage.data_ptr() + 4096, 256)]
++    backend, registered_calls, unregistered_calls = _make_register_memory_region_backend(
++        monkeypatch,
++        [("weight", storage)],
++        [
++            {
++                "address": storage.data_ptr(),
++                "size": storage.numel() * storage.element_size(),
++                "state": "active_allocated",
++            }
++        ],
++        stale_blocks=stale_blocks,
++    )
++
++    assert backend.register_memory_region(object(), True)
++
++    assert unregistered_calls == [[stale_blocks[0][0]]]
++    assert registered_calls == [([storage.data_ptr()], [40])]
++    assert backend.registered_weight_blocks == [(storage.data_ptr(), 40)]
++
++
++def test_register_memory_region_aborts_when_stale_unregister_fails(monkeypatch):
++    storage = torch.arange(10, dtype=torch.float32)
++    stale_blocks = [(storage.data_ptr() + 4096, 256)]
++    backend, registered_calls, unregistered_calls = _make_register_memory_region_backend(
++        monkeypatch,
++        [("weight", storage)],
++        [
++            {
++                "address": storage.data_ptr(),
++                "size": storage.numel() * storage.element_size(),
++                "state": "active_allocated",
++            }
++        ],
++        stale_blocks=stale_blocks,
++        unregister_error=True,
++    )
++
++    assert not backend.register_memory_region(object(), True)
++
++    assert registered_calls == []
++    assert unregistered_calls == [[stale_blocks[0][0]]]
++    assert backend.registered_weight_blocks == stale_blocks
++
++
+ def test_transferable_tensor_scan_depends_on_runtime_layout(monkeypatch):
+     class _RuntimeImpl:
+         def __init__(self):
+@@ -190,3 +258,206 @@ def test_get_remote_instance_transfer_engine_info_non_200_returns_three_values(m
+     )
+ 
+     assert get_remote_instance_transfer_engine_info("http://seed", "seed-key") == (None, None, None)
++
++
++def test_subtract_weight_blocks_cuts_excluded_ranges():
++    assert _subtract_weight_blocks([(0, 100)], []) == [(0, 100)]
++    assert _subtract_weight_blocks([(0, 100)], [(0, 100)]) == []
++    assert _subtract_weight_blocks([(0, 100)], [(10, 20)]) == [(0, 10), (30, 70)]
++    assert _subtract_weight_blocks([(0, 100)], [(-50, 60)]) == [(10, 90)]
++    assert _subtract_weight_blocks([(0, 100)], [(90, 50)]) == [(0, 90)]
++    assert _subtract_weight_blocks([(0, 100)], [(200, 10)]) == [(0, 100)]
++    assert _subtract_weight_blocks(
++        [(0, 100), (200, 100)],
++        [(50, 10), (240, 10)],
++    ) == [(0, 50), (60, 40), (200, 40), (250, 50)]
++
++
++def test_split_tensors_by_excluded_blocks_separates_shared_storage():
++    storage = torch.arange(10)
++    shared_tensor = storage[:3]
++    own_tensor = torch.arange(4)
++
++    kept_tensors, excluded_names = _split_tensors_by_excluded_blocks(
++        [("model.embed_tokens.weight", shared_tensor), ("layers.0.fc.weight", own_tensor)],
++        [(storage.data_ptr(), shared_tensor.numel() * shared_tensor.element_size())],
++    )
++
++    assert [name for name, _ in kept_tensors] == ["layers.0.fc.weight"]
++    assert excluded_names == ["model.embed_tokens.weight"]
++
++
++def test_split_tensors_by_excluded_blocks_noop_without_exclusion():
++    tensor = torch.arange(6)
++    kept_tensors, excluded_names = _split_tensors_by_excluded_blocks([("weight", tensor)], [])
++
++    assert kept_tensors == [("weight", tensor)]
++    assert excluded_names == []
++
++
++def _make_register_memory_region_backend(
++    monkeypatch,
++    tensors,
++    snapshot_blocks,
++    stale_blocks=(),
++    unregister_error=False,
++):
++    registered_calls = []
++    unregistered_calls = []
++
++    def batch_register_memory(addresses, sizes):
++        registered_calls.append((list(addresses), list(sizes)))
++        return SimpleNamespace(is_error=lambda: False)
++
++    def batch_unregister_memory(addresses):
++        unregistered_calls.append(list(addresses))
++        return SimpleNamespace(is_error=lambda: unregister_error, to_string=lambda: "mock unregister error")
++
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend.rfork_transfer_engine = SimpleNamespace(
++        batch_register_memory=batch_register_memory,
++        batch_unregister_memory=batch_unregister_memory,
++    )
++    backend.registered_weight_blocks = list(stale_blocks)
++    monkeypatch.setattr(
++        transfer_backend,
++        "_iter_transferable_tensors",
++        lambda model, processed_layout: iter(tensors),
++    )
++    snapshot = [{"blocks": snapshot_blocks}]
++    monkeypatch.setattr(
++        torch,
++        "npu",
++        SimpleNamespace(memory=SimpleNamespace(memory_snapshot=lambda: snapshot)),
++        raising=False,
++    )
++    return backend, registered_calls, unregistered_calls
++
++
++def test_register_memory_region_skips_shared_weights(monkeypatch):
++    storage = torch.arange(100, dtype=torch.float32)
++    shared_weight = storage[:10]
++    own_weight = storage[20:32].reshape(2, 6)
++    backend, registered_calls, _ = _make_register_memory_region_backend(
++        monkeypatch,
++        [("model.embed_tokens.weight", shared_weight), ("layers.0.fc.weight", own_weight)],
++        [
++            {
++                "address": storage.data_ptr(),
++                "size": storage.numel() * storage.element_size(),
++                "state": "active_allocated",
++            }
++        ],
++    )
++
++    excluded_blocks = [(storage.data_ptr(), 40)]
++    assert backend.register_memory_region(object(), True, exclude_blocks=excluded_blocks)
++
++    assert set(backend.rfork_transfer_engine_weights_info_dict) == {"layers.0.fc.weight"}
++    assert [name for name, _ in backend._registered_transferable_tensors] == ["layers.0.fc.weight"]
++    assert backend.excluded_weight_blocks == excluded_blocks
++    assert registered_calls == [([storage.data_ptr() + 40], [360])]
++    assert backend.registered_weight_blocks == [(storage.data_ptr() + 40, 360)]
++
++
++def test_register_memory_region_registers_all_weights_without_exclusion(monkeypatch):
++    storage = torch.arange(100, dtype=torch.float32)
++    weight_a = storage[:10]
++    weight_b = storage[20:32]
++    backend, registered_calls, _ = _make_register_memory_region_backend(
++        monkeypatch,
++        [("a.weight", weight_a), ("b.weight", weight_b)],
++        [
++            {
++                "address": storage.data_ptr(),
++                "size": storage.numel() * storage.element_size(),
++                "state": "active_allocated",
++            }
++        ],
++    )
++
++    assert backend.register_memory_region(object(), True)
++
++    assert set(backend.rfork_transfer_engine_weights_info_dict) == {"a.weight", "b.weight"}
++    assert registered_calls == [([storage.data_ptr()], [400])]
++    assert backend.excluded_weight_blocks == []
++
++
++def test_register_memory_region_skips_empty_batch_after_excluding_all_weights(monkeypatch):
++    storage = torch.arange(10, dtype=torch.float32)
++    backend, registered_calls, _ = _make_register_memory_region_backend(
++        monkeypatch,
++        [("model.embed_tokens.weight", storage)],
++        [
++            {
++                "address": storage.data_ptr(),
++                "size": storage.numel() * storage.element_size(),
++                "state": "active_allocated",
++            }
++        ],
++    )
++
++    excluded_blocks = [(storage.data_ptr(), storage.numel() * storage.element_size())]
++    assert backend.register_memory_region(object(), True, exclude_blocks=excluded_blocks)
++
++    assert backend.rfork_transfer_engine_weights_info_dict == {}
++    assert backend.rfork_transfer_engine_weights_shape_dict == {}
++    assert backend._registered_transferable_tensors == []
++    assert backend.registered_weight_blocks == []
++    assert registered_calls == []
++
++
++def test_recv_from_source_defensively_skips_pre_registered_weights(monkeypatch):
++    storage = torch.arange(100, dtype=torch.float32)
++    shared_weight = storage[:10]
++    own_weight = storage[20:32]
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend.rfork_transfer_engine = SimpleNamespace(
++        batch_transfer_sync_read=lambda *args: SimpleNamespace(is_error=lambda: False)
++    )
++    backend.rfork_transfer_engine_weights_shape_dict = {}
++    backend.excluded_weight_blocks = [(storage.data_ptr(), 40)]
++    backend._registered_transferable_tensors = None
++
++    monkeypatch.setattr(
++        transfer_backend,
++        "_iter_transferable_tensors",
++        lambda model, processed_layout: iter(
++            [
++                ("model.embed_tokens.weight", shared_weight),
++                ("layers.0.fc.weight", own_weight),
++            ]
++        ),
++    )
++
++    monkeypatch.setattr(
++        transfer_backend,
++        "get_remote_instance_transfer_engine_info",
++        lambda *args: (
++            "seed-session",
++            {"layers.0.fc.weight": [7, own_weight.numel(), own_weight.element_size()]},
++            None,
++        ),
++    )
++
++    assert backend.recv_from_source(object(), "127.0.0.1", 8000, "seed-key", True)
++    assert backend.rfork_transfer_engine_weights_shape_dict == {"layers.0.fc.weight": tuple(own_weight.shape)}
++
++
++def test_recv_from_source_fails_for_unknown_weight_outside_shared_blocks(monkeypatch):
++    own_weight = torch.arange(12, dtype=torch.float32)
++    backend = RForkTransferBackend.__new__(RForkTransferBackend)
++    backend.rfork_transfer_engine = SimpleNamespace(
++        batch_transfer_sync_read=lambda *args: SimpleNamespace(is_error=lambda: False)
++    )
++    backend.rfork_transfer_engine_weights_shape_dict = {}
++    backend.excluded_weight_blocks = [(4096, 128)]
++    backend._registered_transferable_tensors = [("layers.0.fc.weight", own_weight)]
++
++    monkeypatch.setattr(
++        transfer_backend,
++        "get_remote_instance_transfer_engine_info",
++        lambda *args: ("seed-session", {}, None),
++    )
++
++    assert not backend.recv_from_source(object(), "127.0.0.1", 8000, "seed-key", True)
+diff --git a/vllm_ascend/model_loader/rfork/rfork_loader.py b/vllm_ascend/model_loader/rfork/rfork_loader.py
+index 8e757fe23..fd45eb89b 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_loader.py
++++ b/vllm_ascend/model_loader/rfork/rfork_loader.py
+@@ -318,6 +318,17 @@ class RForkModelLoader(BaseModelLoader):
+             )
+         return rfork_worker
+ 
++    def _get_target_registered_blocks(
++        self,
++        vllm_config: VllmConfig,
++        model_config: ModelConfig,
++    ) -> list[tuple[int, int]]:
++        if not _is_draft_model(vllm_config, model_config):
++            return []
++        target_worker = getattr(self.load_config, "rfork_worker", None)
++        target_transfer_backend = getattr(target_worker, "transfer_backend", None)
++        return list(getattr(target_transfer_backend, "registered_weight_blocks", None) or [])
++
+     def _requires_processed_layout_transfer(self, model_config: ModelConfig) -> bool:
+         return getattr(model_config, "quantization", None) is not None
+ 
+@@ -359,6 +370,7 @@ class RForkModelLoader(BaseModelLoader):
+                     raise
+ 
+             rfork_worker = self._ensure_rfork_worker(vllm_config, model_config)
++            rfork_worker.set_excluded_weight_blocks(self._get_target_registered_blocks(vllm_config, model_config))
+             processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
+             try:
+                 if not rfork_worker.is_seed_available():
+@@ -400,7 +412,11 @@ class RForkModelLoader(BaseModelLoader):
+                 logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", e)
+ 
+                 rfork_worker.post_transfer()
+-                rfork_worker.reset_transfer_state()
++                if not rfork_worker.reset_transfer_state():
++                    logger.warning(
++                        "RFork memory regions are still registered in the engine after "
++                        "cleanup; they will be retried before the fallback re-registers."
++                    )
+ 
+                 if need_del:
+                     _reset_process_global_model_state(vllm_config, model)
+@@ -428,7 +444,11 @@ class RForkModelLoader(BaseModelLoader):
+                     raise
+ 
+                 try:
+-                    rfork_worker.reset_transfer_state()
++                    if not rfork_worker.reset_transfer_state():
++                        logger.warning(
++                            "Unregister failed after fallback load; start_seed_service "
++                            "retries it before re-registering memory."
++                        )
+                     rfork_worker.start_seed_service(model, processed_layout_transfer)
+                 except Exception as e:
+                     logger.warning(
+diff --git a/vllm_ascend/model_loader/rfork/rfork_worker.py b/vllm_ascend/model_loader/rfork/rfork_worker.py
+index 559856d31..341113042 100644
+--- a/vllm_ascend/model_loader/rfork/rfork_worker.py
++++ b/vllm_ascend/model_loader/rfork/rfork_worker.py
+@@ -46,6 +46,7 @@ class RForkWorker:
+         self.transfer_backend = RForkTransferBackend()
+         self.ready_to_start_seed_service = False
+         self.seed_service_started = False
++        self._excluded_weight_blocks: list[tuple[int, int]] = []
+         self.seed_timeout_sec = seed_timeout_sec
+         self.seed_protocol = RForkSeedProtocol(
+             disaggregation_mode=disaggregation_mode,
+@@ -64,22 +65,32 @@ class RForkWorker:
+         self.rfork_seed = self.seed_protocol.get_seed()
+         return self.rfork_seed is not None
+ 
++    def set_excluded_weight_blocks(self, excluded_blocks: list[tuple[int, int]] | None) -> None:
++        self._excluded_weight_blocks = list(excluded_blocks) if excluded_blocks else []
++
+     def pre_transfer(self, model, processed_layout: bool) -> bool:
+         try:
+             assert self.transfer_backend.is_initialized(), "transfer_backend is not initialized, cannot pre_transfer."
+-            result = self.transfer_backend.register_memory_region(model, processed_layout)
++            result = self.transfer_backend.register_memory_region(
++                model,
++                processed_layout,
++                self._excluded_weight_blocks,
++            )
+             self.ready_to_start_seed_service = result
+             return result
+         except AssertionError as e:
+             logger.exception("Pre-transfer failed for device_id=%s: %s", self.device_id, e)
+             return False
+ 
+-    def reset_transfer_state(self) -> None:
++    def reset_transfer_state(self) -> bool:
++        unregistered = False
+         try:
+-            self.transfer_backend.unregister_memory_region()
++            unregistered = self.transfer_backend.unregister_memory_region()
+         except Exception as e:
+             logger.warning("Failed to unregister rfork memory region: %s", e)
++        # Never serve a stale registration after reset.
+         self.ready_to_start_seed_service = False
++        return unregistered
+ 
+     def transfer(self, model, processed_layout: bool) -> bool:
+         try:
+diff --git a/vllm_ascend/model_loader/rfork/transfer_backend.py b/vllm_ascend/model_loader/rfork/transfer_backend.py
+index 36192f2b9..8321a998b 100644
+--- a/vllm_ascend/model_loader/rfork/transfer_backend.py
++++ b/vllm_ascend/model_loader/rfork/transfer_backend.py
+@@ -251,6 +251,55 @@ def _block_contains_weight_ptr(address: int, size: int, sorted_weight_ptrs: list
+     return index < len(sorted_weight_ptrs) and sorted_weight_ptrs[index] < address + size
+ 
+ 
++def _is_ptr_in_blocks(ptr: int, blocks: list[tuple[int, int]]) -> bool:
++    return any(address <= ptr < address + size for address, size in blocks)
++
++
++def _split_tensors_by_excluded_blocks(
++    transferable_tensors: list[tuple[str, torch.Tensor]],
++    excluded_blocks: list[tuple[int, int]],
++) -> tuple[list[tuple[str, torch.Tensor]], list[str]]:
++    if not excluded_blocks:
++        return list(transferable_tensors), []
++
++    kept_tensors: list[tuple[str, torch.Tensor]] = []
++    excluded_names: list[str] = []
++    for name, tensor in transferable_tensors:
++        if _is_ptr_in_blocks(tensor.data_ptr(), excluded_blocks):
++            excluded_names.append(name)
++        else:
++            kept_tensors.append((name, tensor))
++    return kept_tensors, excluded_names
++
++
++def _subtract_weight_blocks(
++    weight_blocks: list[tuple[int, int]],
++    excluded_blocks: list[tuple[int, int]],
++) -> list[tuple[int, int]]:
++    if not weight_blocks or not excluded_blocks:
++        return list(weight_blocks)
++
++    sorted_excluded = sorted(excluded_blocks)
++    residual_blocks: list[tuple[int, int]] = []
++    for address, size in weight_blocks:
++        block_end = address + size
++        cursor = address
++        for excluded_address, excluded_size in sorted_excluded:
++            excluded_end = excluded_address + excluded_size
++            if excluded_end <= cursor:
++                continue
++            if excluded_address >= block_end:
++                break
++            if excluded_address > cursor:
++                residual_blocks.append((cursor, excluded_address - cursor))
++            cursor = max(cursor, excluded_end)
++            if cursor >= block_end:
++                break
++        if cursor < block_end:
++            residual_blocks.append((cursor, block_end - cursor))
++    return residual_blocks
++
++
+ def _iter_transfer_chunks(
+     weight_names: list[str],
+     seed_ptr_list: list[int],
+@@ -295,6 +344,7 @@ class RForkTransferBackend:
+         self.rfork_transfer_engine_weights_info_dict = None
+         self.rfork_transfer_engine_weights_shape_dict = None
+         self.registered_weight_blocks = []
++        self.excluded_weight_blocks: list[tuple[int, int]] = []
+         self._registered_transferable_tensors: list[tuple[str, torch.Tensor]] | None = None
+         self._is_initialized = False
+         self.init_transfer_engine()
+@@ -334,15 +384,43 @@ class RForkTransferBackend:
+             raise RuntimeError("TransferEngine is not initialized.")
+         return self.rfork_transfer_engine
+ 
+-    def register_memory_region(self, model, processed_layout: bool):
++    def register_memory_region(
++        self,
++        model,
++        processed_layout: bool,
++        exclude_blocks: list[tuple[int, int]] | None = None,
++    ):
+         transfer_engine = self._get_transfer_engine()
+         start_reg_mr_time = time.perf_counter()
+         self._registered_transferable_tensors = None
+ 
++        if self.registered_weight_blocks:
++            stale_block_count = len(self.registered_weight_blocks)
++            if not self._unregister_weight_blocks(transfer_engine):
++                return False
++            logger.info(
++                "Retried unregister for %d blocks left registered by a failed reset.",
++                stale_block_count,
++            )
++
++        # Exclude target-owned ranges because HCCL rejects overlaps.
++        excluded_blocks = list(exclude_blocks) if exclude_blocks else []
++        self.excluded_weight_blocks = excluded_blocks
++
++        transferable_tensors, excluded_names = _split_tensors_by_excluded_blocks(
++            list(_iter_transferable_tensors(model, processed_layout)),
++            excluded_blocks,
++        )
++        if excluded_names:
++            logger.info(
++                "Skipping %d weights shared with the target model (already registered), e.g. %s",
++                len(excluded_names),
++                ", ".join(excluded_names[:3]),
++            )
++
+         weight_mr_dict = {}
+         weight_shape_dict = {}
+         weight_addr_set = set()
+-        transferable_tensors = list(_iter_transferable_tensors(model, processed_layout))
+         for name, weight in transferable_tensors:
+             weight_mr_dict[name] = (
+                 weight.data_ptr(),
+@@ -379,16 +457,24 @@ class RForkTransferBackend:
+             if current_weight_block is not None:
+                 weight_blocks_for_reg_mr.append(current_weight_block)
+ 
+-        addresses, sizes = zip(*weight_blocks_for_reg_mr) if weight_blocks_for_reg_mr else ((), ())
+-        ret = transfer_engine.batch_register_memory(addresses, sizes)
+-        if ret.is_error():
+-            self._registered_transferable_tensors = None
+-            logger.error(
+-                "batch_register_memory failed for %d blocks, ret: %s",
+-                len(weight_blocks_for_reg_mr),
+-                ret.to_string(),
++        weight_blocks_for_reg_mr = _subtract_weight_blocks(weight_blocks_for_reg_mr, excluded_blocks)
++
++        if weight_blocks_for_reg_mr:
++            addresses, sizes = zip(*weight_blocks_for_reg_mr)
++            ret = transfer_engine.batch_register_memory(addresses, sizes)
++            if ret.is_error():
++                self._registered_transferable_tensors = None
++                logger.error(
++                    "batch_register_memory failed for %d blocks, ret: %s",
++                    len(weight_blocks_for_reg_mr),
++                    ret.to_string(),
++                )
++                return False
++        else:
++            logger.info(
++                "No memory blocks left to register after excluding %d shared blocks.",
++                len(excluded_blocks),
+             )
+-            return False
+ 
+         self.rfork_transfer_engine_weights_info_dict = weight_mr_dict
+         self.rfork_transfer_engine_weights_shape_dict = weight_shape_dict
+@@ -401,16 +487,7 @@ class RForkTransferBackend:
+         )
+         return True
+ 
+-    def unregister_memory_region(self) -> bool:
+-        transfer_engine = self._get_transfer_engine()
+-        start_unreg_mr_time = time.perf_counter()
+-        if not self.registered_weight_blocks:
+-            self.rfork_transfer_engine_weights_info_dict = None
+-            self.rfork_transfer_engine_weights_shape_dict = None
+-            self._registered_transferable_tensors = None
+-            logger.debug("unregister_memory_region skipped because no blocks are registered.")
+-            return True
+-
++    def _unregister_weight_blocks(self, transfer_engine: Any) -> bool:
+         ret = transfer_engine.batch_unregister_memory([address for address, _ in self.registered_weight_blocks])
+         if ret.is_error():
+             logger.error(
+@@ -423,6 +500,20 @@ class RForkTransferBackend:
+         self.rfork_transfer_engine_weights_shape_dict = None
+         self.registered_weight_blocks = []
+         self._registered_transferable_tensors = None
++        return True
++
++    def unregister_memory_region(self) -> bool:
++        transfer_engine = self._get_transfer_engine()
++        start_unreg_mr_time = time.perf_counter()
++        if not self.registered_weight_blocks:
++            self.rfork_transfer_engine_weights_info_dict = None
++            self.rfork_transfer_engine_weights_shape_dict = None
++            self._registered_transferable_tensors = None
++            logger.debug("unregister_memory_region skipped because no blocks are registered.")
++            return True
++
++        if not self._unregister_weight_blocks(transfer_engine):
++            return False
+         logger.info(
+             "unregister_memory_region time: %.4fs",
+             time.perf_counter() - start_unreg_mr_time,
+@@ -460,6 +551,16 @@ class RForkTransferBackend:
+         for name, tensor in transferable_tensors:
+             weight_info = seed_weight_info.get(name, None)
+             if weight_info is None:
++                # Handle legacy callers that rebuild the filtered tensor list.
++                if _is_ptr_in_blocks(
++                    tensor.data_ptr(),
++                    getattr(self, "excluded_weight_blocks", None) or [],
++                ):
++                    logger.debug(
++                        "Skip RFork weight %s shared with the target model: not present in the seed manifest.",
++                        name,
++                    )
++                    continue
+                 logger.error("Cannot find weight info for %s.", name)
+                 return False
+ 
+-- 
+2.54.0
+
