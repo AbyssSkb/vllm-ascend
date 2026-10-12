@@ -58,7 +58,10 @@ patch(
 patch("vllm.distributed.parallel_state._DCP", _mock_dcp_group).start()
 patch("torch.npu.set_device").start()
 
-from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec  # noqa: E402
+from vllm_ascend.core.kv_cache_interface import (  # noqa: E402
+    AscendSFAIndexerCacheSpec,
+    AscendSlidingWindowMLASpec,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
     MAX_REQUESTS_PER_PEER_HANDLER,
     GroupPull,
@@ -306,6 +309,39 @@ class TestKVCacheSendingThread(unittest.TestCase):
 
 
 class TestMooncakeTransferGroups(unittest.TestCase):
+    def test_dsv4_kernel_block_ids_keep_group_coordinates(self):
+        for block_size in (32, 64, 128):
+            worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+            worker.block_size = block_size
+            for group_type, compress_ratio, scale in (
+                ("AscendSlidingWindowMLASpec", 1, 1),
+                ("AscendMLAAttentionSpec", 4, 1),
+                ("AscendMLAAttentionSpec", 128, 1),
+                ("MambaSpec", 1, 1),
+            ):
+                with self.subTest(block_size=block_size, group_type=group_type, compress_ratio=compress_ratio):
+                    worker.block_size_scale = [[scale]]
+                    group_spec = {
+                        "kv_cache_spec_type": group_type,
+                        "kv_cache_spec": {"layer_0": {"compress_ratio": compress_ratio}},
+                    }
+                    meta = types.SimpleNamespace(
+                        local_block_ids=([20],),
+                        remote_block_ids=([10, 11],),
+                        remote_block_size=block_size,
+                        num_computed_tokens=0,
+                    )
+                    local_ids, remote_ids = worker._get_kernel_block_ids([0], cast(ReqMeta, meta), 0, group_spec)
+                    self.assertEqual(local_ids, list(range(20 * scale, 21 * scale)))
+                    self.assertEqual(
+                        remote_ids,
+                        [10, 11] if group_type == "MambaSpec" else list(range(10 * scale, 11 * scale)),
+                    )
+                    if compress_ratio > 1:
+                        meta.num_computed_tokens = block_size // scale * compress_ratio
+                        _, remote_ids = worker._get_kernel_block_ids([0], cast(ReqMeta, meta), 0, group_spec)
+                        self.assertEqual(remote_ids, list(range(10 * scale + 1, 11 * scale + 1)))
+
     def test_glm_sfa_indexer_uses_independent_metadata_layer(self):
         mla_layer = "model.layers.3.self_attn.attn"
         sfa_layer = "model.layers.3.self_attn.indexer.k_cache"
@@ -1997,6 +2033,72 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
             ),
         ):
             self.scheduler = MooncakeConnectorScheduler(self.config, "test_engine", MockKVCacheConfig())
+
+    def test_uses_dsv4_swa_block_size(self):
+        for block_size, physical_block_size in ((32, 2), (64, 4), (128, 8)):
+            for uniform in (False, True):
+                with self.subTest(block_size=block_size, uniform=uniform):
+                    config = MockVllmConfig()
+                    config.cache_config.block_size = physical_block_size
+                    layer_name = "model.layers.0.self_attn"
+                    swa_spec = AscendSlidingWindowMLASpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=128,
+                        dtype=torch.bfloat16,
+                        sliding_window=4096,
+                        model_version="deepseek_v4",
+                    )
+                    group_spec = (
+                        UniformTypeKVCacheSpecs(block_size=block_size, kv_cache_specs={layer_name: swa_spec})
+                        if uniform
+                        else swa_spec
+                    )
+                    kv_cache_config = MockKVCacheConfig(
+                        kv_cache_groups=[MockKVCacheGroup(layer_names=[layer_name], kv_cache_spec=group_spec)]
+                    )
+                    with (
+                        patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.init_ascend_config"),
+                        patch(
+                            "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config",
+                            return_value=MagicMock(),
+                        ),
+                    ):
+                        scheduler = MooncakeConnectorScheduler(config, "test_engine", kv_cache_config)
+
+                    self.assertEqual(scheduler.block_size, block_size)
+                    self.assertEqual(config.cache_config.block_size, physical_block_size)
+                    request = self._make_remote_decode_request(block_size + 1)
+                    _, params = scheduler.request_finished(request, ([10, 11, 12],))
+                    self.assertEqual(params["remote_block_size"], block_size)
+                    self.assertEqual(params["num_prompt_blocks"], 2)
+                    self.assertEqual(params["remote_block_ids"], ([10, 11],))
+
+    def test_keeps_non_dsv4_block_size(self):
+        swa_spec = AscendSlidingWindowMLASpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=4096,
+        )
+        for group_spec in (
+            swa_spec,
+            MLAAttentionSpec(
+                block_size=2, num_kv_heads=1, head_size=128, dtype=torch.bfloat16, model_version="deepseek_v4"
+            ),
+        ):
+            with self.subTest(group_spec=group_spec):
+                kv_cache_config = MockKVCacheConfig(kv_cache_groups=[MockKVCacheGroup(kv_cache_spec=group_spec)])
+                with (
+                    patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.init_ascend_config"),
+                    patch(
+                        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config",
+                        return_value=MagicMock(),
+                    ),
+                ):
+                    scheduler = MooncakeConnectorScheduler(self.config, "test_engine", kv_cache_config)
+                self.assertEqual(scheduler.block_size, 16)
 
     def _make_remote_decode_request(self, prompt_len: int, request_id: str = "req1"):
         return MockRequest(
