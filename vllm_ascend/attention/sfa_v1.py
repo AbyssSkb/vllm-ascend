@@ -674,6 +674,11 @@ class AscendSFAImpl(MLAAttentionImpl):
             reasons.append("fused_qkv_a_proj is None, mlapo is disabled.")
 
         if pp_type is PreprocessType.PROLOG_V3:
+            # Keep the native indexer query even when skip_topk changes later.
+            if self.has_indexer:
+                wq_b = getattr(self.indexer, "wq_b", None)
+                if not hasattr(wq_b, "weight_scale"):
+                    reasons.append("PROLOG_V3 requires a quantized indexer query projection.")
             if self.is_kv_producer:
                 reasons.append("PROLOG_V3 is disabled on KV producer workers.")
             if self._quant_type is None and self.enable_sparse_sfa_c8:

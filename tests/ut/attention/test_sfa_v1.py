@@ -782,6 +782,52 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert metadata.group_key_cache_idx is actual_args[3]
 
 
+class TestAscendSFAPrologIndexerCompatibility(TestBase):
+    def setUp(self):
+        self.impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        self.impl.is_kv_consumer = True
+        self.impl.is_kv_producer = False
+        self.impl.enable_dsa_cp = False
+        self.impl.enable_mlapo = False
+        self.impl.kv_a_layernorm = object()
+        self.impl.q_a_layernorm = object()
+        self.impl.q_proj = SimpleNamespace(_chunk_size=0)
+        self.impl.has_indexer = True
+
+    def test_resolve_indexer_projection_compatibility(self):
+        for qt, enable_c8 in (
+            (AscendW8A8DynamicLinearMethod, True),
+            (AscendW8A8MXFP8DynamicLinearMethod, False),
+            (None, False),
+        ):
+            quant_method = qt.__new__(qt) if qt is not None else None
+            self.impl.fused_qkv_a_proj = SimpleNamespace(quant_method=SimpleNamespace(quant_method=quant_method))
+            self.impl.enable_sparse_sfa_c8 = enable_c8
+            for skip_topk in (False, True):
+                self.impl.skip_topk = skip_topk
+                for quantized_indexer in (False, True):
+                    with self.subTest(qt=qt, skip_topk=skip_topk, quantized_indexer=quantized_indexer):
+                        wq_b = SimpleNamespace(weight_scale=object()) if quantized_indexer else SimpleNamespace()
+                        self.impl.indexer = SimpleNamespace(wq_b=wq_b)
+                        with patch.object(self.impl, "_process_weights_for_fused_prolog_v3") as process_weights:
+                            result = self.impl._resolve_preprocess_type(torch.bfloat16)
+                        expected = PreprocessType.PROLOG_V3 if quantized_indexer else PreprocessType.NATIVE
+                        self.assertEqual(result, expected)
+                        if quantized_indexer:
+                            process_weights.assert_called_once_with()
+                        else:
+                            process_weights.assert_not_called()
+
+    def test_resolve_prolog_without_indexer(self):
+        self.impl.has_indexer = False
+        self.impl.enable_sparse_sfa_c8 = False
+        self.impl.fused_qkv_a_proj = SimpleNamespace(quant_method=SimpleNamespace(quant_method=None))
+        with patch.object(self.impl, "_process_weights_for_fused_prolog_v3") as process_weights:
+            result = self.impl._resolve_preprocess_type(torch.bfloat16)
+        self.assertEqual(result, PreprocessType.PROLOG_V3)
+        process_weights.assert_called_once_with()
+
+
 class TestAscendSFAImpl(TestBase):
     @patch("vllm.distributed.parallel_state._TP", new_callable=lambda: MagicMock(spec=GroupCoordinator))
     @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
