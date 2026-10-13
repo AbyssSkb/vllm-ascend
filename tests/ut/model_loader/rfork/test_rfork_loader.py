@@ -14,10 +14,12 @@
 # limitations under the License.
 #
 
+import gc
 import sys
 from contextlib import nullcontext
 from functools import wraps
 from types import SimpleNamespace
+from weakref import WeakKeyDictionary, ref
 
 import pytest
 import torch
@@ -1049,6 +1051,174 @@ def test_rfork_fallback_restores_routed_experts_moe_counter(monkeypatch):
     _reset_process_global_model_state(vllm_config, snapshot=snapshot)
 
     assert _FakeAscendRoutedExperts.moe_counter == 4
+
+
+@pytest.fixture
+def reload_metadata(monkeypatch):
+    from vllm.model_executor.model_loader.reload import layerwise
+
+    registry = WeakKeyDictionary()
+    monkeypatch.setattr(layerwise, "LAYERWISE_INFO", registry)
+
+    class _Expert(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.empty(32, 32))
+            original_loader = self.weight_loader
+
+            # ModelSlim wraps a bound loader, retaining the real layer through metadata.
+            @wraps(original_loader)
+            def wrapped_loader(*args, **kwargs):
+                return original_loader(*args, **kwargs)
+
+            self.weight_loader = wrapped_loader
+            self.weight.weight_loader = wrapped_loader
+
+        def weight_loader(self, param, loaded_weight, *args, **kwargs):
+            param.data.copy_(loaded_weight)
+
+    return SimpleNamespace(registry=registry, record=layerwise.record_metadata_for_reloading, expert=_Expert)
+
+
+@pytest.mark.parametrize("failure_stage", ["seed", "registration", "initialize"])
+def test_rfork_fallback_releases_wrapped_loader_weights_before_default_load(
+    monkeypatch, reload_metadata, failure_stage
+):
+    import vllm.model_executor.model_loader as model_loader
+
+    loader = RForkModelLoader(DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"}))
+    model_config = SimpleNamespace(dtype=torch.float32, model="/models/test", quantization="ascend")
+    vllm_config = _vllm_config(model_config=model_config)
+    target = reload_metadata.expert()
+    reload_metadata.record(target)
+    target_metadata = reload_metadata.registry[target]
+    failed_refs = []
+
+    def initialize_model(**kwargs):
+        model = torch.nn.Module()
+        model.shared = target
+        model.experts = reload_metadata.expert()
+        failed_refs.extend((ref(model.experts), ref(model.experts.weight)))
+        reload_metadata.record(model)
+        if failure_stage == "initialize":
+            raise RuntimeError("failed after recording partial model metadata")
+        return model
+
+    def get_model(**kwargs):
+        # Check at the allocation boundary, rather than after the second model exists.
+        assert all(weak_ref() is None for weak_ref in failed_refs)
+        assert reload_metadata.registry[target] is target_metadata
+        model = reload_metadata.expert()
+        reload_metadata.record(model)
+        return model
+
+    session = SimpleNamespace(
+        register_destination=lambda *args: failure_stage != "registration",
+        acquire_seed=lambda: False,
+        prepare_for_fallback=lambda: RForkFallbackCleanupResult(True, True, True),
+        start_seed_service=lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: session)
+    monkeypatch.setattr(model_loader, "get_model", get_model)
+    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.initialize_model", initialize_model)
+    # Pytest's retained log records otherwise keep the failed initializer traceback alive.
+    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.logger.warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
+        lambda: SimpleNamespace(eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None)),
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.model_loader.rfork.rfork_loader._rfork_pre_transfer_weight_processing",
+        lambda model: nullcontext(),
+    )
+    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.process_weights_after_loading", lambda *args: None)
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(synchronize=lambda: None, empty_cache=lambda: None), raising=False
+    )
+
+    model = loader.load_model(vllm_config=vllm_config, model_config=model_config)
+
+    assert failed_refs
+    assert model in reload_metadata.registry
+    assert reload_metadata.registry[target] is target_metadata
+
+
+def test_rfork_success_preserves_new_reload_metadata(monkeypatch, reload_metadata):
+    loader = RForkModelLoader(DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"}))
+    model_config = SimpleNamespace(dtype=torch.float32, model="/models/test", quantization=None)
+    vllm_config = _vllm_config(model_config=model_config)
+    created_refs = []
+
+    def initialize_model(**kwargs):
+        model = reload_metadata.expert()
+        reload_metadata.record(model)
+        created_refs.append(ref(model))
+        return model
+
+    session = SimpleNamespace(
+        register_destination=lambda *args: True,
+        acquire_seed=lambda: True,
+        transfer_from_seed=lambda *args: True,
+        log_transferred_model_layout=lambda *args: "digest",
+        start_seed_service=lambda *args, **kwargs: True,
+        prepare_for_fallback=lambda: pytest.fail("successful transfer must not clean up reload metadata"),
+    )
+    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: session)
+    monkeypatch.setattr(loader, "_requires_processed_layout_transfer", lambda mc: False)
+    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.initialize_model", initialize_model)
+    monkeypatch.setattr(
+        "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
+        lambda: SimpleNamespace(eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None)),
+    )
+    monkeypatch.setattr(
+        "vllm_ascend.model_loader.rfork.rfork_loader._rfork_skip_unquantized_moe_post_load_processing",
+        lambda model: nullcontext(),
+    )
+    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.process_weights_after_loading", lambda *args: None)
+
+    model = loader.load_model(vllm_config=vllm_config, model_config=model_config)
+
+    assert model is created_refs[0]()
+    assert model in reload_metadata.registry
+    assert reload_metadata.registry[model].restore_metadata[0]["weight"].weight_loader.__wrapped__.__self__ is model
+
+
+def test_rfork_reload_metadata_snapshot_does_not_keep_existing_layers_alive(reload_metadata):
+    layer = torch.nn.Linear(32, 32)
+    layer_ref, weight_ref = ref(layer), ref(layer.weight)
+    reload_metadata.record(layer)
+
+    snapshot = _snapshot_process_global_model_state(_vllm_config())
+    del layer
+    gc.collect()
+
+    assert layer_ref() is None
+    assert weight_ref() is None
+    assert not reload_metadata.registry
+    assert snapshot.reload_metadata_layers is not None
+    assert not snapshot.reload_metadata_layers
+
+
+def test_rfork_clears_reload_metadata_first_imported_during_failed_initialization(monkeypatch, reload_metadata):
+    module_name = "vllm.model_executor.model_loader.reload.layerwise"
+    layerwise = sys.modules[module_name]
+    monkeypatch.delitem(sys.modules, module_name)
+    vllm_config = _vllm_config()
+    snapshot = _snapshot_process_global_model_state(vllm_config)
+    monkeypatch.setitem(sys.modules, module_name, layerwise)
+    layer = reload_metadata.expert()
+    layer_ref, weight_ref = ref(layer), ref(layer.weight)
+    reload_metadata.record(layer)
+    del layer
+    gc.collect()
+    assert layer_ref() is not None and weight_ref() is not None
+
+    _reset_process_global_model_state(vllm_config, snapshot=snapshot)
+    gc.collect()
+
+    assert not reload_metadata.registry
+    assert layer_ref() is None
+    assert weight_ref() is None
 
 
 def test_rfork_pre_transfer_weight_processing_unwraps_and_restores_quant_methods(monkeypatch):
