@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass
 from typing import Any, cast
+from weakref import WeakKeyDictionary, WeakSet
 
 import torch
 import torch.nn as nn
@@ -78,6 +79,7 @@ class _RForkProcessGlobalModelState:
     ascend_moe_counter: int = INITIAL_ASCEND_MOE_COUNTER
     ascend_rope_caches: tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None] | None = None
     dynamo_bytecode_hook_ids: frozenset[int] = frozenset()
+    reload_metadata_layers: WeakSet[Module] | None = None
 
 
 def _is_rfork_summary_rank(session: RForkSession) -> bool:
@@ -283,6 +285,9 @@ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProce
     ascend_moe_layers = (registry, list(registry)) if isinstance(registry, list) else None
     routed_experts = getattr(sys.modules.get("vllm_ascend.ops.fused_moe.routed_experts"), "AscendRoutedExperts", None)
     ascend_moe_counter = getattr(routed_experts, "moe_counter", INITIAL_ASCEND_MOE_COUNTER)
+    reload_metadata = getattr(
+        sys.modules.get("vllm.model_executor.model_loader.reload.layerwise"), "LAYERWISE_INFO", None
+    )
     return _RForkProcessGlobalModelState(
         static_forward_context,
         static_all_moe_layers,
@@ -291,6 +296,7 @@ def _snapshot_process_global_model_state(vllm_config: VllmConfig) -> _RForkProce
         ascend_moe_counter,
         ascend_rope_caches,
         frozenset(_get_dynamo_bytecode_hooks()),
+        WeakSet(reload_metadata) if isinstance(reload_metadata, WeakKeyDictionary) else WeakSet(),
     )
 
 
@@ -302,6 +308,23 @@ def _reset_process_global_model_state(
     """Restore process-global registries to their pre-attempt state."""
     stale_module_ids = {id(module) for module in model.modules()} if model is not None else set()
     _remove_discarded_compilation_hooks(stale_module_ids, snapshot)
+
+    reload_metadata = getattr(
+        sys.modules.get("vllm.model_executor.model_loader.reload.layerwise"), "LAYERWISE_INFO", None
+    )
+    if (
+        isinstance(reload_metadata, WeakKeyDictionary)
+        and snapshot is not None
+        and snapshot.reload_metadata_layers is not None
+    ):
+        removed_count = 0
+        # Metadata can retain a layer through a wrapped weight_loader despite its weak key.
+        for layer in list(reload_metadata):
+            if layer not in snapshot.reload_metadata_layers:
+                del reload_metadata[layer]
+                removed_count += 1
+        if removed_count:
+            logger.info("RFork fallback removed %d discarded model reload metadata entries.", removed_count)
 
     adaptor = getattr(sys.modules.get("vllm_ascend.eplb.adaptor.vllm_adaptor"), "VllmEplbAdaptor", None)
     registry = getattr(adaptor, "_registered_moe_layers", None)
