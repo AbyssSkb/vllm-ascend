@@ -17,15 +17,17 @@ def _engram_int8_dequant_kernel(codes_ptr, scales_ptr, output_ptr, rows, WIDTH: 
 
 @triton.jit
 def _engram_int8_gather_dequant_kernel(
-    weight_ptr, scale_ptr, ids_ptr, output_ptr, rows, WIDTH: tl.constexpr
+    weight_ptr, scale_ptr, ids_ptr, output_ptr, rows, table_rows, WIDTH: tl.constexpr
 ):
     row = tl.program_id(0)
     if row >= rows:
         return
     offsets = tl.arange(0, WIDTH)
     source_row = tl.load(ids_ptr + row)
-    codes = tl.load(weight_ptr + source_row * WIDTH + offsets).to(tl.float32)
-    scales = tl.load(scale_ptr + source_row * (WIDTH // 32) + offsets // 32)
+    valid = (source_row >= 0) & (source_row < table_rows)
+    safe_row = tl.where(valid, source_row, 0)
+    codes = tl.load(weight_ptr + safe_row * WIDTH + offsets, valid).to(tl.float32)
+    scales = tl.load(scale_ptr + safe_row * (WIDTH // 32) + offsets // 32, valid)
     tl.store(output_ptr + row * WIDTH + offsets, (codes * scales).to(tl.bfloat16))
 
 
@@ -36,15 +38,11 @@ def dequantize_engram_int8(codes: torch.Tensor, scales: torch.Tensor) -> torch.T
         raise ValueError("Engram Triton INT8 dequant expects [rows, 256] and [rows, 8]")
     init_device_properties_triton()
     output = torch.empty(codes.shape, dtype=torch.bfloat16, device=codes.device)
-    _engram_int8_dequant_kernel[(codes.shape[0],)](
-        codes, scales, output, codes.shape[0], WIDTH=256, num_warps=4
-    )
+    _engram_int8_dequant_kernel[(codes.shape[0],)](codes, scales, output, codes.shape[0], WIDTH=256, num_warps=4)
     return output
 
 
-def gather_dequantize_engram_int8(
-    weight: torch.Tensor, scales: torch.Tensor, ids: torch.Tensor
-) -> torch.Tensor:
+def gather_dequantize_engram_int8(weight: torch.Tensor, scales: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
     if (
         weight.device.type != "npu"
         or weight.dtype != torch.int8
@@ -62,6 +60,6 @@ def gather_dequantize_engram_int8(
     init_device_properties_triton()
     output = torch.empty((ids.shape[0], 256), dtype=torch.bfloat16, device=weight.device)
     _engram_int8_gather_dequant_kernel[(ids.shape[0],)](
-        weight, scales, ids, output, ids.shape[0], WIDTH=256, num_warps=4
+        weight, scales, ids, output, ids.shape[0], weight.shape[0], WIDTH=256, num_warps=4
     )
     return output
