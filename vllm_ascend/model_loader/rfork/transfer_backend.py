@@ -820,6 +820,7 @@ class RForkTransferBackend:
             peer_session_id=seed_info.session_id,
             processed_layout=processed_layout,
             known_formats=self.weight_formats,
+            known_transfer_bytes=dict(zip(weight_names, client_len_list, strict=True)),
         )
 
         chunks = list(iter_transfer_chunks(weight_names, seed_ptr_list, client_ptr_list, client_len_list))

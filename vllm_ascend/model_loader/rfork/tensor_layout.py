@@ -25,6 +25,7 @@ from vllm_ascend.model_loader.rfork.manifest import (
 )
 
 TENSOR_LAYOUT_SAMPLE_LIMIT = 3
+NPU_FORMAT_FRACTAL_NZ = 29
 
 # Exact types only: numeric subclasses can carry tensor attributes.
 _TENSOR_ATTRIBUTE_LEAF_TYPES = frozenset({str, bytes, int, float, bool, complex, type(None)})
@@ -82,6 +83,7 @@ def log_tensor_layout_summary(
     processed_layout: bool,
     peer_session_id: str | None = None,
     known_formats: dict[str, int] | None = None,
+    known_transfer_bytes: dict[str, int] | None = None,
 ) -> None:
     """Log a bounded summary of logical and physical tensor layouts at INFO."""
     if not logger.isEnabledFor(logging.INFO):
@@ -103,6 +105,14 @@ def log_tensor_layout_summary(
     unique_storages: set[tuple[str, int]] = set()
     storage_view_tensors = 0
     physical_nonlogical_tensors = 0
+    transfer_diagnostics: dict[str, Any] = {}
+    if stage == "receiver_before_read" and known_transfer_bytes is not None and logger.isEnabledFor(logging.DEBUG):
+        transfer_diagnostics = {
+            "transfer_bytes": 0,
+            "nz_storage_transfer_mismatch_tensors": 0,
+            "nz_storage_transfer_mismatch_samples": [],
+            "note": "Whole storage may include shared views; length differences do not prove missing transfer.",
+        }
 
     def capture(read, field: str):
         try:
@@ -125,6 +135,10 @@ def log_tensor_layout_summary(
         storage_offset = capture(lambda tensor=tensor: int(tensor.storage_offset()), "storage_offset")
         storage_bytes = capture(lambda tensor=tensor: int(tensor.untyped_storage().nbytes()), "storage_bytes")
         storage_ptr = capture(lambda tensor=tensor: int(tensor.untyped_storage().data_ptr()), "storage_ptr")
+        data_ptr = capture(lambda tensor=tensor: int(tensor.data_ptr()), "data_ptr")
+        data_ptr_minus_storage_ptr = (
+            data_ptr - storage_ptr if isinstance(data_ptr, int) and isinstance(storage_ptr, int) else "unavailable"
+        )
         if known_formats is not None and name in known_formats:
             npu_format: Any = known_formats[name]
         elif getattr(getattr(tensor, "device", None), "type", None) == "npu" and torch_npu is not None:
@@ -177,7 +191,19 @@ def log_tensor_layout_summary(
         }
         semantic_records.append(semantic)
         physical_records.append(physical)
-        sample = {**semantic, **physical, "device": device}
+        sample = {**semantic, **physical, "device": device, "data_ptr_minus_storage_ptr": data_ptr_minus_storage_ptr}
+        if transfer_diagnostics and known_transfer_bytes is not None and name in known_transfer_bytes:
+            transfer_bytes = known_transfer_bytes[name]
+            transfer_diagnostics["transfer_bytes"] += transfer_bytes
+            if (
+                npu_format == NPU_FORMAT_FRACTAL_NZ
+                and isinstance(storage_bytes, int)
+                and storage_bytes != transfer_bytes
+            ):
+                transfer_diagnostics["nz_storage_transfer_mismatch_tensors"] += 1
+                mismatch_samples = transfer_diagnostics["nz_storage_transfer_mismatch_samples"]
+                if len(mismatch_samples) < TENSOR_LAYOUT_SAMPLE_LIMIT:
+                    mismatch_samples.append({**sample, "transfer_bytes": transfer_bytes})
         if len(fallback_samples) < TENSOR_LAYOUT_SAMPLE_LIMIT:
             fallback_samples.append(sample)
         if (is_storage_view or is_physical_nonlogical) and len(samples) < TENSOR_LAYOUT_SAMPLE_LIMIT:
@@ -207,6 +233,14 @@ def log_tensor_layout_summary(
         samples,
         error_counts,
     )
+    if transfer_diagnostics:
+        logger.debug(
+            "RFork tensor transfer layout: stage=%s session=%s peer_session=%s transfer_diagnostics=%s",
+            stage,
+            session_id,
+            peer_session_id,
+            transfer_diagnostics,
+        )
 
 
 def reshape_tensor_to_seed_shape(

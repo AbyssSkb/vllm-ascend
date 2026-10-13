@@ -196,6 +196,124 @@ def test_layout_summary_includes_npu_format_and_physical_size(tensor_runtime, mo
     assert "'npu_storage_numel': 12" in message
 
 
+@pytest.mark.parametrize("is_view", [False, True])
+def test_transfer_layout_reports_storage_length_difference_without_claiming_missing_bytes(
+    tensor_runtime, monkeypatch, caplog, is_view
+):
+    class NPUTensorProxy:
+        device = SimpleNamespace(type="npu")
+
+        def __init__(self, tensor):
+            self._tensor = tensor
+
+        def __getattr__(self, name):
+            return getattr(self._tensor, name)
+
+        def untyped_storage(self):
+            return SimpleNamespace(nbytes=lambda: 32, data_ptr=lambda: self._tensor.untyped_storage().data_ptr())
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(get_npu_format=lambda tensor: 29, get_storage_size=lambda tensor: 8),
+    )
+    tensor = NPUTensorProxy(
+        torch.arange(8, dtype=torch.float32)[2:6] if is_view else torch.arange(4, dtype=torch.float32)
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=tensor_runtime.tensor_layout.logger.name):
+        tensor_runtime.tensor_layout.log_tensor_layout_summary(
+            [("weight", tensor)],
+            stage="receiver_before_read",
+            session_id="receiver-session",
+            processed_layout=True,
+            known_transfer_bytes={"weight": 16},
+        )
+
+    info_record = next(record for record in caplog.records if "RFork tensor layout summary:" in record.message)
+    transfer_record = next(record for record in caplog.records if "RFork tensor transfer layout:" in record.message)
+    assert transfer_record.levelno == logging.DEBUG
+    diagnostics = transfer_record.args[-1]
+    assert diagnostics["transfer_bytes"] == 16
+    assert diagnostics["nz_storage_transfer_mismatch_tensors"] == 1
+    sample = diagnostics["nz_storage_transfer_mismatch_samples"][0]
+    assert sample["storage_bytes"] == 32 and sample["transfer_bytes"] == 16
+    assert sample["data_ptr_minus_storage_ptr"] == (8 if is_view else 0)
+    assert "shared views" in diagnostics["note"] and "do not prove missing transfer" in diagnostics["note"]
+    assert "'transfer_bytes'" not in info_record.message
+
+
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+@pytest.mark.parametrize("stage", ["registered", "receiver_before_read"])
+def test_transfer_layout_samples_are_bounded_and_do_not_change_layout_digests(tensor_runtime, caplog, level, stage):
+    tensors = [(f"weight_{index}", torch.arange(8, dtype=torch.float32)[:4]) for index in range(6)]
+    formats = {name: 29 for name, _ in tensors}
+    transfer_bytes = {name: 16 for name, _ in tensors}
+    with caplog.at_level(level, logger=tensor_runtime.tensor_layout.logger.name):
+        for known_transfer_bytes in (None, transfer_bytes):
+            tensor_runtime.tensor_layout.log_tensor_layout_summary(
+                tensors,
+                stage=stage,
+                session_id="receiver-session",
+                processed_layout=True,
+                known_formats=formats,
+                known_transfer_bytes=known_transfer_bytes,
+            )
+
+    summaries = [record for record in caplog.records if "RFork tensor layout summary:" in record.message]
+    assert len(summaries) == 2
+    assert summaries[0].args[10:12] == summaries[1].args[10:12]
+    assert summaries[0].args[10:12] == (
+        "052976b878898f80a653c3150f1544485790560c32d31eedcd530397e769d8b5",
+        "7614952f0db97c9f75844b5b420907341ecaf23b5535f37f7d56e14acd21cb7b",
+    )
+    records = [record for record in caplog.records if "RFork tensor transfer layout:" in record.message]
+    assert len(records) == int(level == logging.DEBUG and stage == "receiver_before_read")
+    if records:
+        diagnostics = records[0].args[-1]
+        assert diagnostics["transfer_bytes"] == 96
+        assert diagnostics["nz_storage_transfer_mismatch_tensors"] == 6
+        assert [sample["name"] for sample in diagnostics["nz_storage_transfer_mismatch_samples"]] == [
+            "weight_0",
+            "weight_1",
+            "weight_2",
+        ]
+
+
+def test_receiver_layout_diagnostic_uses_actual_read_lengths_without_rescanning(tensor_runtime, monkeypatch):
+    transfer_backend = tensor_runtime.transfer_backend
+    tensor = torch.arange(4, dtype=torch.float32)
+    backend = tensor_runtime.RForkTransferBackend(tp_rank=0)
+    backend.transfer_session_id = "receiver-session"
+    backend._registered_transferable_tensors = [("weight", tensor)]
+    backend.weight_formats = {"weight": 0}
+    read = Mock(return_value=SimpleNamespace(is_error=lambda: False))
+    backend.transfer_engine = SimpleNamespace(batch_transfer_sync_read=read)
+    summary = Mock()
+    monkeypatch.setattr(transfer_backend, "log_tensor_layout_summary", summary)
+    monkeypatch.setattr(
+        transfer_backend, "collect_transferable_tensors", Mock(side_effect=AssertionError("must reuse tensor cache"))
+    )
+    manifest = sys.modules["vllm_ascend.model_loader.rfork.manifest"]
+    monkeypatch.setattr(manifest, "read_npu_format", lambda tensor: 0)
+    seed = tensor_runtime.SeedTransferInfo(
+        "seed-session", {"weight": [1024, 4, 4, [4], "float32"]}, formats={"weight": 0}
+    )
+
+    assert backend.read_weights_from_seed(object(), seed, True)
+
+    summary.assert_called_once_with(
+        [("weight", tensor)],
+        stage="receiver_before_read",
+        session_id="receiver-session",
+        peer_session_id="seed-session",
+        processed_layout=True,
+        known_formats={"weight": 0},
+        known_transfer_bytes={"weight": 16},
+    )
+    read.assert_called_once_with("seed-session", [tensor.data_ptr()], [1024], [16])
+
+
 def test_post_load_layout_summary_is_observational(tensor_runtime, monkeypatch, caplog):
     tensor_layout = tensor_runtime.tensor_layout
     monkeypatch.setattr(tensor_layout, "is_tensor_on_transfer_device", lambda tensor: True)

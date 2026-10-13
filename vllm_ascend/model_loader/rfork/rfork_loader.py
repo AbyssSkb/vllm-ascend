@@ -15,12 +15,15 @@
 #
 
 import gc
+import logging
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any, cast
 
 import torch
@@ -65,6 +68,9 @@ FALLBACK_CLEANUP_MAX_ATTEMPTS = 2
 FALLBACK_MEMORY_RECLAIM_PASSES = 4
 RFORK_FALLBACK_EXCEPTIONS = (ImportError, OSError, RuntimeError, ValueError)
 INITIAL_ASCEND_MOE_COUNTER = -1
+POST_LOAD_TIMING_SAMPLE_LIMIT = 10
+NZ_TIMING_FIRST_CALLS = 2
+NZ_TIMING_FORMAT = 29
 
 
 @dataclass
@@ -419,6 +425,202 @@ def _rfork_pre_transfer_weight_processing(model: Module):
             quant_method.process_weights_after_loading = process_weights
 
 
+def _rfork_tensor_diagnostics(tensor: torch.Tensor, torch_npu: Any) -> dict[str, Any]:
+    """Read layout metadata after the native call so diagnostics cannot warm it up."""
+
+    def read(operation):
+        try:
+            return operation()
+        except Exception as exc:
+            return f"unavailable:{type(exc).__name__}"
+
+    return {
+        "shape": read(lambda: tuple(tensor.shape)),
+        "dtype": read(lambda: str(tensor.dtype)),
+        "stride": read(tensor.stride),
+        "format": read(lambda: torch_npu.get_npu_format(tensor)),
+        "storage_offset": read(tensor.storage_offset),
+        "logical_bytes": read(lambda: tensor.numel() * tensor.element_size()),
+        "storage_bytes": read(lambda: tensor.untyped_storage().nbytes()),
+        "npu_storage_numel": read(lambda: int(torch_npu.get_storage_size(tensor))),
+        "ptr_offset_bytes": read(lambda: tensor.data_ptr() - tensor.untyped_storage().data_ptr()),
+    }
+
+
+@contextmanager
+def _rfork_post_load_timing(model: Module, session: RForkSession, target_device: torch.device):
+    """Time real hooks and serialize only the first NZ call for diagnosis."""
+    if not logger.isEnabledFor(logging.DEBUG):
+        yield
+        return
+
+    import torch_npu
+
+    thread_id = threading.get_ident()
+    modules = list(model.named_modules())
+    module_names = {id(module): name or "<root>" for name, module in modules}
+    missing = object()
+    restored: list[tuple[Any, Any]] = []
+    wrapped_owners: set[int] = set()
+    hook_records: list[tuple[str, str, str, float, bool]] = []
+    cast_records: list[dict[str, Any]] = []
+    first_calls: dict[tuple[str, Any], int] = {}
+    active_hook: tuple[str, str, str] | None = None
+    original_cast = torch_npu.npu_format_cast
+    nz_synchronized = False
+
+    @wraps(original_cast)
+    def timed_cast(weight, *args, **kwargs):
+        nonlocal nz_synchronized
+        if threading.get_ident() != thread_id:
+            return original_cast(weight, *args, **kwargs)
+        destination_format = args[0] if args else kwargs.get("acl_format")
+        if destination_format != NZ_TIMING_FORMAT:
+            return original_cast(weight, *args, **kwargs)
+        stage, name, implementation = active_hook or ("unknown", "<unknown>", "<unknown>")
+        key = (implementation, destination_format)
+        iteration = first_calls.get(key, 0) + 1
+        first_calls[key] = iteration
+        record = {
+            "module": name,
+            "implementation": implementation,
+            "stage": stage,
+            "destination_format": destination_format,
+            "iteration": iteration,
+            "pre_wait": 0.0,
+            "post_wait": 0.0,
+            "call_host": 0.0,
+            "ok": False,
+        }
+        # This deliberate diagnostic barrier changes overlap; it does not add a conversion or warm-up.
+        synchronized = not nz_synchronized
+        if synchronized:
+            nz_synchronized = True
+            started_at = time.perf_counter()
+            torch.npu.synchronize(target_device)
+            record["pre_wait"] = time.perf_counter() - started_at
+        started_at = time.perf_counter()
+        result = None
+        try:
+            result = original_cast(weight, *args, **kwargs)
+            record["ok"] = True
+            return result
+        finally:
+            record["call_host"] = time.perf_counter() - started_at
+            cast_records.append(record)
+            if synchronized and record["ok"]:
+                started_at = time.perf_counter()
+                try:
+                    torch.npu.synchronize(target_device)
+                except Exception as exc:
+                    record["post_sync_error"] = type(exc).__name__
+                    raise
+                finally:
+                    record["post_wait"] = time.perf_counter() - started_at
+            if iteration <= NZ_TIMING_FIRST_CALLS:
+                metadata_started_at = time.perf_counter()
+                source = _rfork_tensor_diagnostics(weight, torch_npu)
+                destination = None if result is None else _rfork_tensor_diagnostics(result, torch_npu)
+                logger.debug(
+                    "RFork %s NZ conversion call: tp_rank=%s module=%s implementation=%s iteration=%s "
+                    "destination_format=%s synchronized=%s pre_wait=%.4fs call_host=%.4fs post_wait=%.4fs "
+                    "metadata_host=%.4fs ok=%s source=%s destination=%s",
+                    _rfork_model_kind(session),
+                    getattr(session.identity, "tp_rank", 0),
+                    name,
+                    implementation,
+                    iteration,
+                    destination_format,
+                    synchronized,
+                    record["pre_wait"],
+                    record["call_host"],
+                    record["post_wait"],
+                    time.perf_counter() - metadata_started_at,
+                    record["ok"],
+                    source,
+                    destination,
+                )
+
+    def wrap_hook(owner: Any, stage: str, module_name: str) -> None:
+        if owner is None or id(owner) in wrapped_owners:
+            return
+        original = getattr(owner, "process_weights_after_loading", None)
+        if not callable(original):
+            return
+        implementation = getattr(owner, "quant_method" if stage == "quant" else "impl", None)
+        implementation_name = type(owner if implementation is None else implementation).__qualname__
+
+        @wraps(original)
+        def timed_hook(*args: Any, **kwargs: Any):
+            nonlocal active_hook
+            if threading.get_ident() != thread_id or active_hook is not None:
+                return original(*args, **kwargs)
+            layer = args[0] if args else kwargs.get("layer")
+            name = module_names.get(id(layer), module_name) if stage == "quant" else module_name
+            active_hook = (stage, name, implementation_name)
+            started_at = time.perf_counter()
+            succeeded = False
+            try:
+                result = original(*args, **kwargs)
+                succeeded = True
+                return result
+            finally:
+                hook_records.append((stage, name, implementation_name, time.perf_counter() - started_at, succeeded))
+                active_hook = None
+
+        restored.append((owner, vars(owner).get("process_weights_after_loading", missing)))
+        wrapped_owners.add(id(owner))
+        owner.process_weights_after_loading = timed_hook
+
+    process_started_at = None
+    try:
+        for name, module in modules:
+            wrap_hook(getattr(module, "quant_method", None), "quant", name or "<root>")
+            wrap_hook(module, "module", name or "<root>")
+        torch_npu.npu_format_cast = timed_cast
+        process_started_at = time.perf_counter()
+        yield
+    finally:
+        process_host = 0.0 if process_started_at is None else time.perf_counter() - process_started_at
+        torch_npu.npu_format_cast = original_cast
+        for owner, previous in reversed(restored):
+            if previous is missing:
+                del owner.process_weights_after_loading
+            else:
+                owner.process_weights_after_loading = previous
+        groups: dict[tuple[str, str], dict[str, Any]] = {}
+        for stage, _, implementation, elapsed, succeeded in hook_records:
+            group = groups.setdefault((stage, implementation), {"calls": 0, "host_s": 0.0, "failures": 0})
+            group["calls"] += 1
+            group["host_s"] += elapsed
+            group["failures"] += not succeeded
+        hook_host = sum(record[3] for record in hook_records)
+        logger.debug(
+            "RFork %s post-load hooks: tp_rank=%s process_host=%.4fs hook_host=%.4fs other_host=%.4fs "
+            "calls=%d groups=%s slowest=%s",
+            _rfork_model_kind(session),
+            getattr(session.identity, "tp_rank", 0),
+            process_host,
+            hook_host,
+            process_host - hook_host,
+            len(hook_records),
+            groups,
+            sorted(hook_records, key=lambda record: record[3], reverse=True)[:POST_LOAD_TIMING_SAMPLE_LIMIT],
+        )
+        logger.debug(
+            "RFork %s NZ conversion summary: tp_rank=%s calls=%d call_host=%.4fs pre_wait=%.4fs post_wait=%.4fs "
+            "first_call_synchronized=%s slowest=%s",
+            _rfork_model_kind(session),
+            getattr(session.identity, "tp_rank", 0),
+            len(cast_records),
+            sum(record["call_host"] for record in cast_records),
+            sum(record["pre_wait"] for record in cast_records),
+            sum(record["post_wait"] for record in cast_records),
+            nz_synchronized,
+            sorted(cast_records, key=lambda record: record["call_host"], reverse=True)[:POST_LOAD_TIMING_SAMPLE_LIMIT],
+        )
+
+
 def _is_dynamic_eplb_enabled(vllm_config: VllmConfig) -> bool:
     parallel_config = getattr(vllm_config, "parallel_config", None)
     if bool(getattr(parallel_config, "enable_eplb", False)):
@@ -653,10 +855,38 @@ class RForkModelLoader(BaseModelLoader):
                         "RFork %s model uses post-load tensor layout transfer.",
                         _rfork_model_kind(session),
                     )
-                    with _rfork_pre_transfer_weight_processing(model):
+                    initialization_wait = 0.0
+                    if logger.isEnabledFor(logging.DEBUG):
+                        initialization_sync_started_at = time.perf_counter()
+                        torch.npu.synchronize(target_device)
+                        initialization_wait = time.perf_counter() - initialization_sync_started_at
+                        logger.debug(
+                            "RFork %s post-load initialization drain: tp_rank=%s synchronize_wait=%.4fs",
+                            _rfork_model_kind(session),
+                            getattr(session.identity, "tp_rank", 0),
+                            initialization_wait,
+                        )
+                    process_started_at = time.perf_counter()
+                    with (
+                        _rfork_pre_transfer_weight_processing(model),
+                        _rfork_post_load_timing(model, session, target_device),
+                    ):
                         process_weights_after_loading(model, model_config, target_device)
+                    process_host = time.perf_counter() - process_started_at
                     # Complete async NPU layout conversion before exposing buffers.
+                    synchronize_started_at = time.perf_counter()
                     torch.npu.synchronize()
+                    synchronize_wait = time.perf_counter() - synchronize_started_at
+                    logger.debug(
+                        "RFork %s layout processing stages: initialization_wait=%.4fs process_host=%.4fs "
+                        "synchronize_wait=%.4fs total=%.4fs diagnostic_nz_sync_enabled=%s",
+                        _rfork_model_kind(session),
+                        initialization_wait,
+                        process_host,
+                        synchronize_wait,
+                        time.perf_counter() - layout_start_time,
+                        logger.isEnabledFor(logging.DEBUG),
+                    )
                     logger.debug(
                         "RFork %s model layout processing took %.2f seconds",
                         _rfork_model_kind(session),
