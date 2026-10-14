@@ -10,7 +10,7 @@ from typing import Any
 
 from vllm.logger import logger
 
-from vllm_ascend.model_loader.rfork.config import RForkConfig
+from vllm_ascend.model_loader.rfork.config import MAX_SEED_HTTP_PORT, RForkConfig
 from vllm_ascend.model_loader.rfork.planner_client import RForkPlannerClient, lease_log_id
 from vllm_ascend.model_loader.rfork.seed_client import build_seed_url, fetch_seed_transfer_info
 from vllm_ascend.model_loader.rfork.seed_server import (
@@ -30,6 +30,7 @@ from vllm_ascend.model_loader.rfork.types import (
 )
 
 HEARTBEAT_STOP_GRACE_SEC = 1.0
+SEED_HTTP_PORTS_PER_RANK = 2
 
 
 class RForkSession:
@@ -361,11 +362,28 @@ class RForkSession:
             logger.error("RFork seed service cannot start while a source seed lease is outstanding.")
             return False
         try:
+            port = self.config.seed_port_base
+            if port > 0:
+                # Reserve distinct slots for the main and MTP draft models at each rank.
+                port += SEED_HTTP_PORTS_PER_RANK * self.identity.global_rank + int(self.identity.is_draft_model)
+                if port > MAX_SEED_HTTP_PORT:
+                    logger.warning(
+                        "RFork seed port %d (base=%d, global_rank=%d, draft=%s) exceeds %d, "
+                        "falling back to OS-assigned random port",
+                        port,
+                        self.config.seed_port_base,
+                        self.identity.global_rank,
+                        self.identity.is_draft_model,
+                        MAX_SEED_HTTP_PORT,
+                    )
+                    port = 0
+
             handle = start_rfork_server(
                 self.planner.seed_key,
                 self._seed_transfer_info(),
                 health_timeout_sec=self.config.seed_timeout_sec,
                 bind_host=self.config.seed_bind_host,
+                port=port,
             )
             self.seed_server = handle
             if not self.planner.report_seed_once(

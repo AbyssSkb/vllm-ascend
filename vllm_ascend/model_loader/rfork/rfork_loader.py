@@ -41,6 +41,7 @@ from vllm.model_executor.model_loader.utils import (
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.distributed.parallel_state import get_global_rank
 from vllm_ascend.model_loader.rfork.compat import get_current_hardware_profile
 from vllm_ascend.model_loader.rfork.config import RForkConfig
 from vllm_ascend.model_loader.rfork.identity import build_compatibility_fingerprint
@@ -443,7 +444,7 @@ class RForkModelLoader(BaseModelLoader):
         session = getattr(self.load_config, session_attr, None)
         if session is None:
             is_draft_model = _is_draft_model(vllm_config, model_config)
-            global_rank = torch.distributed.get_rank()
+            global_rank = get_global_rank(vllm_config.parallel_config)
             pp_rank = _get_pp_rank(vllm_config)
             ep_rank = _get_ep_rank(vllm_config)
             tp_rank = get_tensor_model_parallel_rank()

@@ -140,6 +140,34 @@ def test_collector_scans_custom_callable_impl_and_skips_function(tensor_runtime,
     assert all(not name.startswith("impl.function") for name in names)
 
 
+@pytest.mark.parametrize("processed_layout", [False, True])
+def test_collector_excludes_scheduler_sized_topk_indices_buffer(tensor_runtime, monkeypatch, processed_layout):
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_transferable_tensor", lambda _tensor: True)
+
+    def make_model(max_num_batched_tokens):
+        model = nn.Module()
+        model.weight = nn.Parameter(torch.ones(2))
+        model.topk_indices_buffer = torch.empty(max_num_batched_tokens, 2048, dtype=torch.int32)
+        model.indexer_op = nn.Module()
+        model.indexer_op.impl = SimpleNamespace(
+            packed_weight=torch.ones(3),
+            topk_indices_buffer=model.topk_indices_buffer,
+        )
+        return model
+
+    manifests = []
+    for max_num_batched_tokens in (2048, 4096):
+        collected = tensor_runtime.tensor_layout.collect_transferable_tensors(
+            make_model(max_num_batched_tokens), processed_layout
+        )
+        assert all(name.rsplit(".", 1)[-1] != "topk_indices_buffer" for name, _ in collected)
+        manifests.append([(name, tuple(tensor.shape)) for name, tensor in collected])
+
+    assert manifests[0] == manifests[1]
+    assert ("weight", (2,)) in manifests[0]
+    assert ("indexer_op.impl.packed_weight", (3,)) in manifests[0]
+
+
 def test_registration_merges_small_then_large_alias_ranges(tensor_runtime, monkeypatch):
     storage = torch.arange(8, dtype=torch.float32)
     small = storage[:2]

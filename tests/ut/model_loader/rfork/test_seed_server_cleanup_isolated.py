@@ -116,7 +116,7 @@ def _configure_server_fakes(seed_server, monkeypatch, *, blocking_queue=False):
     _ControlledServer.allow_run_exit.clear()
     sockets = []
 
-    def create_socket(bind_host):
+    def create_socket(bind_host, port=0):
         sock = _ControlledSocket()
         sockets.append(sock)
         return sock
@@ -141,6 +141,44 @@ def _configure_server_fakes(seed_server, monkeypatch, *, blocking_queue=False):
 
 def _seed_info():
     return SimpleNamespace(session_id="session", weights={}, shapes={})
+
+
+def test_bound_socket_supports_dynamic_and_requested_ports(seed_server):
+    dynamic = seed_server._create_bound_socket("127.0.0.1")
+    try:
+        port = dynamic.getsockname()[1]
+        assert port > 0
+    finally:
+        dynamic.close()
+    fixed = seed_server._create_bound_socket("127.0.0.1", port)
+    try:
+        assert fixed.getsockname()[1] == port
+        with pytest.raises(OSError, match="unable to bind RFork seed host"):
+            seed_server._create_bound_socket("127.0.0.1", port)
+    finally:
+        fixed.close()
+
+
+@pytest.mark.parametrize("port", [0, 18000])
+def test_server_passes_requested_port_and_reports_bound_port(seed_server, monkeypatch, port):
+    sockets, _ = _configure_server_fakes(seed_server, monkeypatch)
+    create_socket = seed_server._create_bound_socket
+    requested_ports = []
+
+    def record_socket(bind_host, requested_port):
+        requested_ports.append(requested_port)
+        return create_socket(bind_host, requested_port)
+
+    monkeypatch.setattr(seed_server, "_create_bound_socket", record_socket)
+    monkeypatch.setattr(seed_server.requests, "get", lambda *args, **kwargs: SimpleNamespace(status_code=200))
+    handle = seed_server.start_rfork_server("key", _seed_info(), port=port)
+    try:
+        assert requested_ports == [port]
+        assert handle.port == 32123
+    finally:
+        _ControlledServer.allow_run_exit.set()
+        assert handle.stop(timeout=1.0)
+    assert sockets[0].closed.is_set()
 
 
 def test_queue_timeout_can_stop_startup_resource_published_before_put(seed_server, monkeypatch):

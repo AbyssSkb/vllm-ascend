@@ -198,10 +198,25 @@ def loader_runtime(request, monkeypatch):
             self.load_config = load_config
 
     stub("vllm", __path__=[])
-    stub("vllm.config", __path__=[], ModelConfig=SimpleNamespace, VllmConfig=SimpleNamespace)
+    stub(
+        "vllm.config",
+        __path__=[],
+        ModelConfig=SimpleNamespace,
+        VllmConfig=SimpleNamespace,
+        ParallelConfig=SimpleNamespace,
+        get_current_vllm_config=Mock(),
+    )
     stub("vllm.config.load", LoadConfig=SimpleNamespace)
     stub("vllm.distributed", __path__=[], get_tensor_model_parallel_rank=lambda: 0)
-    stub("vllm.distributed.parallel_state", get_ep_group=Mock(), get_pp_group=Mock())
+    world_group = SimpleNamespace(rank_in_group=0)
+    stub(
+        "vllm.distributed.parallel_state",
+        get_ep_group=Mock(),
+        get_pp_group=Mock(),
+        GroupCoordinator=SimpleNamespace,
+        get_world_group=lambda: world_group,
+        init_model_parallel_group=Mock(),
+    )
     stub("vllm.model_executor", __path__=[])
     model_loader = stub(
         "vllm.model_executor.model_loader", __path__=[], register_model_loader=lambda name: lambda cls: cls
@@ -217,6 +232,12 @@ def loader_runtime(request, monkeypatch):
             eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None)
         ),
     )
+    parallel_path = Path(__file__).resolve().parents[4] / "vllm_ascend/distributed/parallel_state.py"
+    parallel_name = "vllm_ascend.distributed.parallel_state"
+    parallel_spec = importlib.util.spec_from_file_location(parallel_name, parallel_path)
+    parallel_module = importlib.util.module_from_spec(parallel_spec)
+    monkeypatch.setitem(sys.modules, parallel_name, parallel_module)
+    parallel_spec.loader.exec_module(parallel_module)
     if getattr(request, "param", None) == "legacy_hardware":
         monkeypatch.setitem(sys.modules, "vllm_ascend.device.hardware_profile", None)
         stub("vllm_ascend.utils", is_310p=lambda: True)
@@ -294,6 +315,7 @@ def loader_runtime(request, monkeypatch):
         fallback=fallback,
         identity_module=identity_module,
         moe_processing=moe_processing,
+        world_group=world_group,
     )
 
 

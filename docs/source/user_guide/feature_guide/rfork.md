@@ -194,7 +194,17 @@ To enable RFork, pass `--load-format rfork` and provide RFork settings through `
 | **rfork_lease_release_max_attempts** | Integer | Maximum number of attempts for lease release, including the initial request. | Optional. Default: `3`. Must be a positive JSON integer. JSON-only `model-loader-extra-config` field; invalid explicit values raise `ValueError`; no environment fallback. Rejected responses stop immediately. |
 | **rfork_lease_release_retry_interval_sec** | Number | Wait between transient lease-release failures. | Optional. Default: `30.0`. Must be a finite, positive JSON number. JSON-only `model-loader-extra-config` field; invalid explicit values raise `ValueError`; no environment fallback. |
 | **rfork_seed_bind_host** | String | Local address/interface for the seed HTTP server. | Optional. Default: `0.0.0.0`. |
+| **rfork_seed_port_base** | Integer | Base port for the seed HTTP servers. | Optional. Default: `0` (OS-assigned port). JSON-only integer in `[0, 65535]`; invalid explicit values raise `ValueError`. |
 | **rfork_seed_advertise_host** | String | Address reported to the planner for later receivers. | Optional. Default: auto-detect the local address. |
+
+With a nonzero `rfork_seed_port_base`, the main model uses
+`base + 2 * global_rank` and the MTP draft model uses the next port. For example,
+base `18000` assigns rank 0 ports `18000`/`18001` and rank 1 ports `18002`/`18003`.
+Here `global_rank` includes the DP replica index for both dense and MoE models.
+A computed port above `65535` falls back to an OS-assigned port. Reserve separate
+port ranges for deployments sharing a host; a port already in use causes seed
+service startup to fail. This option controls the seed HTTP metadata service;
+TransferEngine endpoints continue to use dynamic ports.
 
 RFork manages its environment fallbacks in its own `RForkConfig` configuration module:
 
@@ -215,9 +225,14 @@ wins in the order shown here, with the `rfork_` field taking precedence.
 
 `model_loader_extra_config` takes precedence over environment values for fields
 that support environment fallbacks. Numeric values reject booleans, NaN,
-infinity, and non-positive values. The three operational fields above are
+infinity, and non-positive values. The heartbeat, lease-release, and seed-port fields are
 JSON-only; invalid explicit values raise `ValueError` rather than using an
 environment fallback.
+
+Scheduler-sized `topk_indices_buffer` tensors remain local to each instance and
+are excluded from both checkpoint-layout and processed-layout transfer manifests.
+Their capacity follows the receiver's `max_num_batched_tokens`; packed model
+weights continue to be transferred.
 
 Heartbeat scheduling waits `rfork_heartbeat_interval_sec` after each heartbeat
 request completes (default: `30.0`); it is not a fixed-rate interval. Seed

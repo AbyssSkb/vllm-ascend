@@ -262,7 +262,7 @@ def test_rfork_session_receives_parallel_ranks(monkeypatch):
     monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader._get_pp_rank", lambda config: 3)
     monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader._get_ep_rank", lambda config: 7)
     monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.get_tensor_model_parallel_rank", lambda: 5)
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 11)
+    monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.get_global_rank", lambda config: 11)
 
     session = loader._ensure_rfork_session(vllm_config, model_config)
 
