@@ -193,6 +193,27 @@ def _get_quantization_config_digest(model_config: ModelConfig) -> str | None:
     return hashlib.sha256(canonical_json).hexdigest()
 
 
+def _get_effective_kv_role(vllm_config: VllmConfig) -> str | None:
+    """Return a stable KV role across current and legacy vLLM configs."""
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_transfer_config is None:
+        return None
+
+    kv_role = getattr(kv_transfer_config, "kv_role", None)
+    if kv_role is not None:
+        return str(kv_role)
+
+    is_kv_producer = bool(getattr(kv_transfer_config, "is_kv_producer", False))
+    is_kv_consumer = bool(getattr(kv_transfer_config, "is_kv_consumer", False))
+    if is_kv_producer and is_kv_consumer:
+        return "kv_both"
+    if is_kv_producer:
+        return "kv_producer"
+    if is_kv_consumer:
+        return "kv_consumer"
+    return None
+
+
 def build_compatibility_fingerprint(
     vllm_config: VllmConfig,
     model_config: ModelConfig,
@@ -238,6 +259,8 @@ def build_compatibility_fingerprint(
             "is_moe_model": _canonicalize_fingerprint_value(getattr(parallel_config, "is_moe_model", None)),
         },
         "weight_layout": {
+            # P/D roles can materialize different SFA/MLA inference tensors.
+            "kv_role": _get_effective_kv_role(vllm_config),
             "weight_nz_mode": _canonicalize_fingerprint_value(weight_nz_mode),
             "hardware_policy": _canonicalize_fingerprint_value(hardware_policy),
         },

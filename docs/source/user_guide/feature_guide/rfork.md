@@ -168,7 +168,7 @@ request duration.
 
 - **Scale-out after a first successful load**: The first instance may still load from storage, but later instances with the same deployment identity can reuse it as a seed and shorten startup time.
 - **Elastic serving clusters**: Because RFork asks a planner for available seeds, it fits clusters where instances are created and reclaimed dynamically.
-- **Topology-sensitive deployments**: RFork encodes optional `pp_rank`, `tp_rank`, and optional `ep_rank` into the seed key, so only shard-compatible instances are matched together. The `kv_role` and the physical node are deliberately excluded, so prefill and decode instances on different nodes can share seeds.
+- **Topology-sensitive deployments**: RFork encodes optional `pp_rank`, `tp_rank`, and optional `ep_rank` into the seed key, so only shard-compatible instances are matched together. The compatibility fingerprint also includes `kv_role`, keeping prefill and decode seed pools separate. The physical node is excluded, so instances with the same role and model shard can share seeds across nodes.
 
 ---
 
@@ -238,14 +238,16 @@ RFork does not match instances by `model_url` alone. The seed identity is compos
 - `ep_rank` when expert parallelism is enabled for an MoE model
 - `draft` role when the worker runs as a draft model
 
-The parallel ranks keep seed and receiver on the same model shard, while the
-disaggregation role (`kv_role`) and the physical node are deliberately excluded
-so prefill and decode instances on different nodes can share seeds.
+The parallel ranks keep seed and receiver on the same model shard. The
+disaggregation role (`kv_role`) enters the compatibility fingerprint because
+prefill and decode can materialize different SFA/MLA inference tensors. The
+physical node is excluded, so instances with the same role and shard can share
+seeds across nodes.
 
 The identity is anchored by a SHA256 compatibility fingerprint covering model
 revision, dtype, quantization method, a digest of the full quantization config,
 model architecture, tensor/pipeline/expert parallel world sizes, Ascend NZ
-layout mode, and hardware layout policy. This prevents an old or differently
+layout mode, hardware layout policy, and KV role. This prevents an old or differently
 configured seed from being selected merely because its textual key happens to
 match.
 

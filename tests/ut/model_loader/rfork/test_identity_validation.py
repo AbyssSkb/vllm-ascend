@@ -123,13 +123,60 @@ def _vllm_config(tp_size=1):
     )
 
 
-def _fingerprint(identity_module, *, dtype=torch.float32, quantization=None, revision="rev-a", tp_size=1):
+def _fingerprint(
+    identity_module, *, dtype=torch.float32, quantization=None, revision="rev-a", tp_size=1, kv_transfer_config=None
+):
+    vllm_config = _vllm_config(tp_size)
+    vllm_config.kv_transfer_config = kv_transfer_config
     return identity_module.build_compatibility_fingerprint(
-        _vllm_config(tp_size),
+        vllm_config,
         _model_config(dtype=dtype, quantization=quantization, revision=revision),
         model_url="model",
         model_deploy_strategy_name="strategy",
     )
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (None, None),
+        (SimpleNamespace(), None),
+        (SimpleNamespace(kv_role="kv_producer"), "kv_producer"),
+        (SimpleNamespace(kv_role="kv_consumer"), "kv_consumer"),
+        (SimpleNamespace(kv_role="kv_both"), "kv_both"),
+        (SimpleNamespace(is_kv_producer=True), "kv_producer"),
+        (SimpleNamespace(is_kv_consumer=True), "kv_consumer"),
+        (SimpleNamespace(is_kv_producer=True, is_kv_consumer=True), "kv_both"),
+    ],
+)
+def test_effective_kv_role_supports_current_and_legacy_configs(identity_module, config, expected):
+    assert identity_module._get_effective_kv_role(SimpleNamespace(kv_transfer_config=config)) == expected
+
+
+def test_seed_keys_partition_kv_roles(identity_module):
+    keys = {
+        identity_module.build_seed_key(
+            0,
+            "model",
+            "strategy",
+            _fingerprint(identity_module, kv_transfer_config=SimpleNamespace(kv_role=role)),
+        )
+        for role in (None, "kv_producer", "kv_consumer", "kv_both")
+    }
+    assert len(keys) == 4
+
+
+@pytest.mark.parametrize(
+    ("role", "producer", "consumer"),
+    [("kv_producer", True, False), ("kv_consumer", False, True), ("kv_both", True, True)],
+)
+def test_legacy_kv_role_matches_explicit_role(identity_module, role, producer, consumer):
+    explicit = _fingerprint(identity_module, kv_transfer_config=SimpleNamespace(kv_role=role))
+    legacy = _fingerprint(
+        identity_module,
+        kv_transfer_config=SimpleNamespace(is_kv_producer=producer, is_kv_consumer=consumer),
+    )
+    assert explicit == legacy
 
 
 def test_canonicalization_is_deterministic_for_dicts_sets_and_dtype(identity_module):
