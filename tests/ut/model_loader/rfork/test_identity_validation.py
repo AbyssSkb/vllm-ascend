@@ -18,6 +18,9 @@ RFORK_ROOT = Path(__file__).resolve().parents[4] / "vllm_ascend/model_loader/rfo
 
 
 def _load_module(monkeypatch, module_name: str, file_name: str):
+    if file_name == "config.py":
+        envs = _load_module(monkeypatch, "vllm_ascend.envs", "../../envs.py")
+        _stub(monkeypatch, "vllm_ascend", __path__=[str(RFORK_ROOT.parents[1])], envs=envs)
     spec = importlib.util.spec_from_file_location(module_name, RFORK_ROOT / file_name)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, module_name, module)
@@ -309,6 +312,7 @@ def test_planner_rejects_invalid_lease_headers_with_error(
         planner_url="http://planner",
         model_url="model",
         model_deploy_strategy_name="strategy",
+        send_model_identity_headers=False,
         lease_release_max_attempts=1,
         lease_release_retry_interval_sec=1.0,
         heartbeat_interval_sec=1.0,

@@ -12,6 +12,8 @@ from unittest.mock import Mock
 import pytest
 import requests
 
+from tests.ut.model_loader.rfork.test_identity_validation import _load_module
+
 
 @pytest.fixture
 def runtime(monkeypatch):
@@ -54,7 +56,7 @@ def runtime(monkeypatch):
         start_rfork_server=Mock(),
     )
     types = load("types")
-    config = load("config")
+    config = _load_module(monkeypatch, f"{prefix}.config", "config.py")
     load("seed_client")
     client = load("planner_client")
     session = load("session")

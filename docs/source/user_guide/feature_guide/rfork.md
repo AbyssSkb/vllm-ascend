@@ -190,6 +190,7 @@ To enable RFork, pass `--load-format rfork` and provide RFork settings through `
 | **rfork_scheduler_url** | String | Base URL of the planner service used for seed allocation, release, and heartbeat. | Required for planner-based matching. Example: `http://127.0.0.1:1223`. |
 | **rfork_seed_timeout_sec** | Number | Timeout for waiting until the local seed HTTP service becomes healthy after startup. | Optional. Default: `5.0`. Must be finite and greater than `0`. Invalid values fall back to a valid environment value, then the default. |
 | **rfork_request_timeout_sec** | Number | Connection/read timeout for each planner and seed HTTP request, not an end-to-end deadline. | Optional. Default: `10.0`. Must be finite and greater than `0`; invalid values fall back to a valid environment value, then the default. |
+| **rfork_model_identity_headers** | Boolean | Attach readable model identity headers to every planner request. | Optional. Default: `false`. An explicit JSON boolean overrides `RFORK_MODEL_IDENTITY_HEADERS`; other JSON types raise `ValueError`. |
 | **rfork_heartbeat_interval_sec** | Number | Delay before the next seed heartbeat after the previous heartbeat request completes. | Optional. Default: `30.0`. Must be a finite, positive JSON number. JSON-only `model-loader-extra-config` field; invalid explicit values raise `ValueError`; no environment fallback. |
 | **rfork_lease_release_max_attempts** | Integer | Maximum number of attempts for lease release, including the initial request. | Optional. Default: `3`. Must be a positive JSON integer. JSON-only `model-loader-extra-config` field; invalid explicit values raise `ValueError`; no environment fallback. Rejected responses stop immediately. |
 | **rfork_lease_release_retry_interval_sec** | Number | Wait between transient lease-release failures. | Optional. Default: `30.0`. Must be a finite, positive JSON number. JSON-only `model-loader-extra-config` field; invalid explicit values raise `ValueError`; no environment fallback. |
@@ -222,6 +223,7 @@ wins in the order shown here, with the `rfork_` field taking precedence.
 | `RFORK_REQUEST_TIMEOUT_SEC` | `10.0` | Finite and positive only. |
 | `RFORK_SEED_BIND_HOST` | `0.0.0.0` | |
 | `RFORK_SEED_ADVERTISE_HOST` | auto-detect | |
+| `RFORK_MODEL_IDENTITY_HEADERS` | `0` | `0`, `1`, `true`, or `false`; case-insensitive, surrounding whitespace ignored. Defined in `vllm_ascend/envs.py`. |
 
 `model_loader_extra_config` takes precedence over environment values for fields
 that support environment fallbacks. Numeric values reject booleans, NaN,
@@ -241,6 +243,34 @@ affect lease release only; the public synchronous release helper uses the same
 configured max-attempt and retry-interval values. Client-side seed deregistration
 (`remove_seed`) keeps its internal retry policy of three attempts with
 `0.1`-second linear backoff.
+
+### Optional Planner Model Identity Headers
+
+Set `"rfork_model_identity_headers": true` in `--model-loader-extra-config`, or set
+`RFORK_MODEL_IDENTITY_HEADERS=1` in the vLLM worker environment, to attach readable
+model metadata to every RFork planner request (`/get_seed`, `/put_seed`,
+`/remove_seed`, and `/add_seed`, including heartbeats). RFork resolves this switch
+when constructing its configuration, with the following priority:
+
+1. An explicit `rfork_model_identity_headers` JSON boolean (`true` or `false`). Other JSON types fail configuration initialization.
+2. The `RFORK_MODEL_IDENTITY_HEADERS` environment variable: `1` or `true` enables the headers; `0` or `false` disables them. Values are case-insensitive and surrounding whitespace is ignored. Other values, including empty or whitespace-only values, fail configuration initialization when no JSON override is supplied.
+3. The default, `false` (disabled).
+
+An explicit JSON `false` disables the headers even when the environment variable
+is `1`. When enabled, `model_url` and `model_deploy_strategy_name` must contain
+only ASCII characters; otherwise configuration initialization fails with an
+error naming the field. This restriction does not apply when disabled.
+
+| HTTP Header | Value |
+| ----------- | ----- |
+| `MODEL_URL` | The resolved RFork `model_url`. |
+| `DEPLOY_STRATEGY` | The resolved RFork `model_deploy_strategy_name`. |
+| `IS_DRAFT` | `true` for a draft model, otherwise `false`. |
+
+The switch is non-sensitive, but enabling it sends model identifiers in plain
+text. Values must be valid HTTP header text; avoid model URLs containing
+credentials. The existing seed key and request headers are preserved. A planner
+must read the additional headers to use or display this metadata.
 
 ### How RFork Matches Seeds
 

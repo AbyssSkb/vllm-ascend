@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from vllm_ascend import envs
+
 DEFAULT_RFORK_SEED_TIMEOUT_SEC = 5.0
 DEFAULT_RFORK_REQUEST_TIMEOUT_SEC = 10.0
 DEFAULT_RFORK_HEARTBEAT_INTERVAL_SEC = 30.0
@@ -66,6 +68,7 @@ class RForkConfig:
     heartbeat_interval_sec: float = DEFAULT_RFORK_HEARTBEAT_INTERVAL_SEC
     lease_release_max_attempts: int = DEFAULT_RFORK_LEASE_RELEASE_MAX_ATTEMPTS
     lease_release_retry_interval_sec: float = DEFAULT_RFORK_LEASE_RELEASE_RETRY_INTERVAL_SEC
+    send_model_identity_headers: bool = False
 
     def __post_init__(self) -> None:
         # These operational settings are JSON-only: reject typos instead of silently
@@ -80,6 +83,14 @@ class RForkConfig:
         port_base = self.seed_port_base
         if isinstance(port_base, bool) or not isinstance(port_base, int) or not 0 <= port_base <= MAX_SEED_HTTP_PORT:
             raise ValueError(f"rfork_seed_port_base must be a JSON integer in range [0, {MAX_SEED_HTTP_PORT}]")
+        if not isinstance(self.send_model_identity_headers, bool):
+            raise ValueError("rfork_model_identity_headers must be a JSON boolean")
+        if self.send_model_identity_headers:
+            for name in ("model_url", "model_deploy_strategy_name"):
+                if not getattr(self, name).isascii():
+                    raise ValueError(
+                        f"{name} must contain only ASCII characters when rfork_model_identity_headers is enabled"
+                    )
 
     @classmethod
     def from_extra_config(cls, raw_config: object) -> "RForkConfig":
@@ -90,7 +101,16 @@ class RForkConfig:
         else:
             raise RuntimeError("RFork requires --model-loader-extra-config to be a JSON object.")
 
+        if "rfork_model_identity_headers" in config:
+            send_model_identity_headers = config["rfork_model_identity_headers"]
+        else:
+            model_identity_headers = envs.RFORK_MODEL_IDENTITY_HEADERS
+            if model_identity_headers not in {"0", "1", "true", "false"}:
+                raise ValueError("RFORK_MODEL_IDENTITY_HEADERS must be '0', '1', 'true' or 'false'")
+            send_model_identity_headers = model_identity_headers in {"1", "true"}
+
         return cls(
+            send_model_identity_headers=send_model_identity_headers,
             heartbeat_interval_sec=config.get("rfork_heartbeat_interval_sec", DEFAULT_RFORK_HEARTBEAT_INTERVAL_SEC),
             lease_release_max_attempts=config.get(
                 "rfork_lease_release_max_attempts", DEFAULT_RFORK_LEASE_RELEASE_MAX_ATTEMPTS

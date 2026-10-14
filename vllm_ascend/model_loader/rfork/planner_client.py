@@ -41,6 +41,7 @@ class RForkPlannerClient:
 
         self.planner_url = config.planner_url
         self.tp_rank = identity.tp_rank
+        self._is_draft_model = identity.is_draft_model
         self.request_timeout_sec = float(request_timeout_sec)
         self.config = config
         self.last_advertisement: SeedAdvertisement | None = None
@@ -66,12 +67,22 @@ class RForkPlannerClient:
                 "rfork_scheduler_url is not set. Configure it through model_loader_extra_config or RFORK_SCHEDULER_URL."
             )
 
+    def _with_model_identity_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        if not self.config.send_model_identity_headers:
+            return headers
+        return {
+            **headers,
+            "MODEL_URL": self.config.model_url,
+            "DEPLOY_STRATEGY": self.config.model_deploy_strategy_name,
+            "IS_DRAFT": str(self._is_draft_model).lower(),
+        }
+
     def acquire_seed(self) -> SeedLease | None:
         try:
             self._require_planner()
             response = requests.get(
                 f"{self.planner_url}/get_seed",
-                headers={"SEED_KEY": self.seed_key},
+                headers=self._with_model_identity_headers({"SEED_KEY": self.seed_key}),
                 timeout=self.request_timeout_sec,
             )
             if response.status_code == 404:
@@ -125,7 +136,7 @@ class RForkPlannerClient:
         try:
             response = requests.post(
                 f"{self.planner_url}/put_seed",
-                headers=headers,
+                headers=self._with_model_identity_headers(headers),
                 timeout=self.request_timeout_sec,
                 allow_redirects=False,
             )
@@ -186,7 +197,7 @@ class RForkPlannerClient:
             try:
                 response = requests.post(
                     f"{self.planner_url}/remove_seed",
-                    headers=headers,
+                    headers=self._with_model_identity_headers(headers),
                     timeout=self.request_timeout_sec,
                 )
                 if response.status_code in (200, 404):
@@ -216,13 +227,15 @@ class RForkPlannerClient:
             advertisement = SeedAdvertisement(seed_ip or get_ip(), port, self.tp_rank)
             response = requests.post(
                 f"{self.planner_url}/add_seed",
-                headers={
-                    "SEED_KEY": self.seed_key,
-                    "SEED_IP": advertisement.seed_ip,
-                    "SEED_PORT": str(advertisement.seed_port),
-                    "SEED_RANK": str(advertisement.seed_rank),
-                    "SEED_REFCNT": "0",
-                },
+                headers=self._with_model_identity_headers(
+                    {
+                        "SEED_KEY": self.seed_key,
+                        "SEED_IP": advertisement.seed_ip,
+                        "SEED_PORT": str(advertisement.seed_port),
+                        "SEED_RANK": str(advertisement.seed_rank),
+                        "SEED_REFCNT": "0",
+                    }
+                ),
                 timeout=self.request_timeout_sec,
             )
             if response.status_code != 200:
