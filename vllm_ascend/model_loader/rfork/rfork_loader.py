@@ -204,6 +204,43 @@ def _make_fallback_load_config(load_config: LoadConfig) -> LoadConfig:
     return fallback_load_config
 
 
+def _get_checkpoint_weight_names(model: Module, model_config: ModelConfig, load_config: LoadConfig) -> set[str]:
+    from safetensors import SafetensorError, safe_open
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+    loader = DefaultModelLoader(_make_fallback_load_config(load_config))
+    sources = [
+        DefaultModelLoader.Source(
+            model_config.model,
+            model_config.revision,
+            fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+            allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+        ),
+        *getattr(model, "secondary_weights", ()),
+    ]
+    weight_names: set[str] = set()
+    for source in sources:
+        _, files, use_safetensors = loader._prepare_weights(
+            source.model_or_path,
+            source.subfolder,
+            source.revision,
+            source.fall_back_to_pt,
+            source.allow_patterns_overrides,
+        )
+        if not use_safetensors:
+            raise ValueError("RFork model-state preparation requires safetensors checkpoint metadata")
+        for path in files:
+            try:
+                with safe_open(path, framework="pt", device="cpu") as checkpoint:
+                    names = checkpoint.keys()
+                    weight_names.update(source.prefix + name for name in names)
+            except SafetensorError as exc:
+                raise ValueError(f"RFork could not read checkpoint metadata from {path}") from exc
+    if not weight_names:
+        raise ValueError("RFork model-state preparation received empty checkpoint metadata")
+    return weight_names
+
+
 def _load_with_default_loader(
     vllm_config: VllmConfig,
     model_config: ModelConfig,
@@ -629,6 +666,7 @@ class RForkModelLoader(BaseModelLoader):
             session: RForkSession | None = None
             model_state_snapshot: _RForkProcessGlobalModelState | None = None
             exclude_blocks: list[tuple[int, int]] = []
+            model_state_prepared = True
             processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
             bypass_reason = mutable_weights_bypass_reason(vllm_config, model_config)
             if bypass_reason is None:
@@ -664,6 +702,16 @@ class RForkModelLoader(BaseModelLoader):
                     _rfork_model_kind(session),
                     time.perf_counter() - model_init_start_time,
                 )
+
+                prepare_for_rfork = getattr(model, "prepare_for_rfork", None)
+                if callable(prepare_for_rfork):
+                    model_state_prepared = False
+                    try:
+                        prepare_for_rfork(_get_checkpoint_weight_names(model, model_config, load_config))
+                    finally:
+                        # A bound method must not keep a discarded model alive during fallback.
+                        del prepare_for_rfork
+                    model_state_prepared = True
 
                 if exclude_blocks and session.can_reuse_shared_weights(
                     model, processed_layout_transfer, exclude_blocks
@@ -775,7 +823,12 @@ class RForkModelLoader(BaseModelLoader):
             model = _load_with_default_loader(vllm_config, model_config, self.load_config, prefix)
 
             # Advertise fallback only via an existing session; startup failure cleans its MR but keeps the model.
-            if session is not None and cleanup_result is not None and cleanup_result.can_schedule_seed:
+            if (
+                model_state_prepared
+                and session is not None
+                and cleanup_result is not None
+                and cleanup_result.can_schedule_seed
+            ):
                 _start_rfork_seed_service(
                     session,
                     model,

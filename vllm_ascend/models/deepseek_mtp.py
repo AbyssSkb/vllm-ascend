@@ -53,14 +53,25 @@ class AscendDeepSeekMTP(DeepSeekMTP):
         mtp_layer = self.model.layers[str(mtp_layer_idx)]
         self.lm_head = mtp_layer.shared_head.head
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def _get_weight_mappers(self) -> list[WeightsMapper]:
+        mappers = []
         if self.quant_config is not None and (cache_scale_mapper := self.quant_config.get_cache_scale_mapper()):
-            weights = cache_scale_mapper.apply(weights)
+            mappers.append(cache_scale_mapper)
 
-        weights_mapper = WeightsMapper(
-            orig_to_new_prefix={"rot.": f"model.layers.{self.config.num_hidden_layers}.rot."},
-        )
-        loaded_weights = super().load_weights(weights_mapper.apply(weights))
+        mappers.append(WeightsMapper(orig_to_new_prefix={"rot.": f"model.layers.{self.config.num_hidden_layers}.rot."}))
+        return mappers
+
+    def prepare_for_rfork(self, weight_names: set[str]) -> None:
+        """Establish checkpoint-dependent head state before RFork registers tensors."""
+        names = list(weight_names)
+        for mapper in self._get_weight_mappers():
+            names = mapper.apply_list(names)
+        self._maybe_set_own_lm_head(set(names))
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        for mapper in self._get_weight_mappers():
+            weights = mapper.apply(weights)
+        loaded_weights = super().load_weights(weights)
         self._maybe_set_own_lm_head(loaded_weights)
         return loaded_weights
 

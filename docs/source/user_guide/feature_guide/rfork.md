@@ -105,6 +105,12 @@ Because the structural digest exists only after the model is built and its memor
 This means two instances must agree on model identity, tensor structure, and deployment topology before the planner will treat them as interchangeable seeds.
 The final manifest is still validated before transfer, and RFork falls back rather than copying incompatible tensors.
 
+For Ascend DeepSeek/GLM MTP drafts, RFork prepares checkpoint-dependent head ownership and module aliases before
+registering tensors. It reads the names in the selected safetensors headers using the default loader's source,
+revision, and file-selection rules. Uncached remote checkpoints may be downloaded during this preparation. If the
+metadata cannot be read, including checkpoints selected in PT/bin format, RFork uses the default loader and does
+not publish that model as a seed. Models without a preparation hook do not require this metadata step.
+
 ### Planner Responsibilities
 
 The planner treats the seed key as an opaque compatibility identifier. RFork derives it from the model/configuration fingerprint, the structural digest of transferable tensors, and shard topology. A planner should:

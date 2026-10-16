@@ -13,7 +13,111 @@ import pytest
 import regex as re
 import torch
 
-from .rfork_test_support import _load_module
+from .rfork_test_support import _load_module, _stub
+
+
+@pytest.fixture
+def mtp_model(tensor_runtime, monkeypatch):
+    class WeightsMapper:
+        def __init__(self, *, orig_to_new_prefix):
+            self.orig_to_new_prefix = orig_to_new_prefix
+
+        def _map_name(self, name):
+            for prefix, replacement in self.orig_to_new_prefix.items():
+                if name.startswith(prefix):
+                    return replacement + name[len(prefix) :] if replacement is not None else None
+            return name
+
+        def apply_list(self, names):
+            return [mapped for name in names if (mapped := self._map_name(name)) is not None]
+
+        def apply(self, weights):
+            return ((mapped, tensor) for name, tensor in weights if (mapped := self._map_name(name)) is not None)
+
+    class DeepSeekMTP(torch.nn.Module):
+        def load_weights(self, weights):
+            return {name for name, _ in weights}
+
+    _stub(monkeypatch, "vllm.compilation.decorators", support_torch_compile=lambda cls: cls)
+    _stub(monkeypatch, "vllm.config", VllmConfig=object)
+    _stub(monkeypatch, "vllm.model_executor.models.deepseek_mtp", DeepSeekMTP=DeepSeekMTP)
+    _stub(monkeypatch, "vllm.model_executor.models.deepseek_v2", GlmMoeDsaForCausalLM=torch.nn.Module)
+    _stub(monkeypatch, "vllm.model_executor.models.utils", AutoWeightsLoader=object, WeightsMapper=WeightsMapper)
+    _stub(monkeypatch, "vllm.sequence", IntermediateTensors=object)
+    _stub(monkeypatch, "vllm_ascend.utils", is_rot_weight_used=lambda _config: False)
+    module = _load_module(monkeypatch, "_rfork_test_mtp_model", "../../models/deepseek_mtp.py")
+    model = module.AscendDeepSeekMTP.__new__(module.AscendDeepSeekMTP)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_hidden_layers=3)
+    model.quant_config = None
+    model.model = torch.nn.Module()
+    model.model.mtp_start_layer_idx = 3
+    layer = torch.nn.Module()
+    layer.shared_head = torch.nn.Module()
+    layer.shared_head.head = torch.nn.Linear(2, 2, bias=False)
+    model.model.layers = torch.nn.ModuleDict({"3": layer})
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_tensor_on_transfer_device", lambda _tensor: True)
+    return SimpleNamespace(model=model, mapper=WeightsMapper)
+
+
+@pytest.mark.parametrize(
+    "head_name, has_own_head",
+    [
+        ("model.layers.3.shared_head.head.weight", True),
+        ("lm_head.weight", False),
+        ("layers.3.shared_head.head.weight", False),
+        ("model.language_model.layers.3.shared_head.head.weight", False),
+        (None, False),
+    ],
+)
+@pytest.mark.parametrize("processed_layout", [False, True])
+def test_mtp_checkpoint_preparation_preserves_registered_structure(
+    tensor_runtime, mtp_model, head_name, has_own_head, processed_layout
+):
+    model = mtp_model.model
+    layout = tensor_runtime.tensor_layout
+    head = model.model.layers["3"].shared_head.head
+    original = head.weight.detach().clone()
+    assert not hasattr(model, "lm_head")
+    names = {head_name} if head_name is not None else set()
+    unprepared_digest = layout.build_structural_digest(layout.collect_transferable_tensors(model, processed_layout))
+
+    model.prepare_for_rfork(names)
+    before = layout.collect_transferable_tensors(model, processed_layout)
+    digest = layout.build_structural_digest(before)
+    loaded = model.load_weights((name, original) for name in names)
+    after = layout.collect_transferable_tensors(model, processed_layout)
+
+    assert loaded == names
+    assert model.has_own_lm_head is has_own_head
+    assert hasattr(model, "lm_head") is has_own_head
+    if has_own_head:
+        assert model.lm_head is head
+    expected = "lm_head.weight" if has_own_head else "model.layers.3.shared_head.head.weight"
+    assert [name for name, _ in before] == [expected]
+    assert [name for name, _ in after] == [expected]
+    assert (digest != unprepared_digest) is has_own_head
+    assert layout.build_structural_digest(after) == digest
+    torch.testing.assert_close(head.weight, original)
+
+
+def test_mtp_preparation_applies_same_checkpoint_mappers_as_loading(mtp_model):
+    model = mtp_model.model
+    mapper = mtp_model.mapper(
+        orig_to_new_prefix={"checkpoint_head.": "model.layers.3.shared_head.head.", "checkpoint_rot.": "rot."}
+    )
+    model.quant_config = SimpleNamespace(get_cache_scale_mapper=lambda: mapper)
+    raw_names = {"checkpoint_head.weight", "checkpoint_rot.weight"}
+
+    model.prepare_for_rfork(raw_names)
+    assert model.has_own_lm_head is True
+    assert model.lm_head is model.model.layers["3"].shared_head.head
+    loaded = model.load_weights((name, torch.ones(2)) for name in raw_names)
+
+    assert loaded == {"model.layers.3.shared_head.head.weight", "model.layers.3.rot.weight"}
+    assert model.has_own_lm_head is True
+    model.load_weights([])
+    assert model.has_own_lm_head is False
 
 
 def test_tensor_collection_deduplicates_exact_impl_alias_but_keeps_distinct_view(tensor_runtime, monkeypatch):
