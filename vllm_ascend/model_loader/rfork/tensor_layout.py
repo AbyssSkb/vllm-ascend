@@ -29,10 +29,9 @@ TENSOR_LAYOUT_SAMPLE_LIMIT = 3
 # Exact types only: numeric subclasses can carry tensor attributes.
 _TENSOR_ATTRIBUTE_LEAF_TYPES = frozenset({str, bytes, int, float, bool, complex, type(None)})
 
-# Runtime scratch tensors are local execution state, not checkpoint-derived
-# model state.  They must keep the capacity selected by the receiving instance
-# instead of being copied from a seed that may use different scheduler limits.
-_RUNTIME_ONLY_TENSOR_NAMES = frozenset({"topk_indices_buffer"})
+# Runtime scratch and locally derived caches are not checkpoint-derived model
+# state. Preserve receiver-owned capacity and storage instead of copying seed state.
+_RUNTIME_ONLY_TENSOR_NAMES = frozenset({"topk_indices_buffer", "_rope_derived_cos_cache", "_rope_derived_sin_cache"})
 
 # Member names printed bare in tensor IDs; anything else is quoted.
 _PLAIN_PATH_SEGMENT = re.compile(r"[A-Za-z0-9_]+")
