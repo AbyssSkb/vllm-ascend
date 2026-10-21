@@ -38,6 +38,35 @@ To enable RFork, pass `--load-format rfork` and provide RFork settings through `
 - Install the runtime dependency `YuanRong TransferEngine` on every RFork instance.
 - Run a planner service that implements the RFork seed protocol. A simple mock planner script is provided at [`rfork_planner.py`](https://github.com/vllm-project/vllm-ascend/blob/main/examples/rfork/rfork_planner.py).
 
+### Engram Host Offload
+
+RFork transfers NPU weights while offloaded DeepSeek V4.1 Engram tables are loaded
+from the local checkpoint. Every receiver therefore needs the matching indexed
+safetensors checkpoint, including the Engram weights and scales, even when a seed
+is available. RFork reuses the Engram shard reader; host tables and process-local
+UVA pointers are not transferred. Engram shared-memory mode is not supported with
+RFork yet; set `dp_shared_memory=false` in `--engram-config`.
+
+The host table must finish loading before destination registration or shared-weight
+reuse. RFork records completion for the supported DeepSeek table implementation
+and checks tensor identity, storage address, and checkpoint binding before exempting
+its host tensors from the non-NPU state check. Other CPU model state is still
+rejected. After the default loader successfully returns, RFork records the same
+state so the locally loaded instance can publish its NPU weights as a seed.
+The model implementation and its default loading path require no RFork hooks.
+
+A seed miss or transfer failure retains the existing default-loader fallback and
+can cause the Engram tables to be read again. The discarded host tables are
+explicitly released before constructing the fallback model; cleanup failure
+stops loading instead of allocating a second copy. RFork accelerates the NPU portion;
+it does not remove host-table disk I/O. Keep the local checkpoint and seed on the
+same model revision, and use a distinct model identity for different checkpoints.
+
+If model construction fails before returning a complete model with Engram CPU
+offload enabled, RFork stops instead of retrying through the default loader.
+Partially constructed host tables cannot be safely released through the model;
+fix the initialization error and restart the worker.
+
 ### Configuration Fields
 
 | Field Name | Type | Description | Allowed Values / Notes |
@@ -105,6 +134,13 @@ Because the structural digest exists only after the model is built and its memor
 
 This means two instances must agree on model identity, tensor structure, and deployment topology before the planner will treat them as interchangeable seeds.
 The final manifest is still validated before transfer, and RFork falls back rather than copying incompatible tensors.
+
+For Ascend DeepSeek/GLM MTP drafts, RFork prepares checkpoint-dependent head ownership and module aliases before
+registering tensors. It reads the names in the selected safetensors headers using the default loader's source,
+revision, and file-selection rules. Uncached remote checkpoints may be downloaded during this preparation. If the
+metadata cannot be read, including checkpoints selected in PT/bin format, RFork uses the default loader and does
+not publish that model as a seed. This adaptation stays within the RFork loader and reuses the model's existing
+head-ownership helper; other model types do not require this metadata step.
 
 ### Planner Responsibilities
 

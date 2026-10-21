@@ -4,6 +4,7 @@
 import builtins
 import importlib.util
 import runpy
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -106,6 +107,20 @@ def test_ascend_engram_limits(engram_config, section, field, value, error):
     setattr(getattr(engram_config, section), field, value)
     with pytest.raises(ValueError, match=error):
         VllmConfig._resolve_and_verify_engram_config(engram_config)
+        _validate_engram_config(engram_config)
+
+
+@pytest.mark.parametrize(
+    "load_format,shared,rejected",
+    [("rfork", True, True), ("rfork", False, False), ("safetensors", True, False)],
+)
+def test_rfork_engram_shared_memory_limit(engram_config, load_format, shared, rejected):
+    from vllm_ascend.platform import _validate_engram_config
+
+    engram_config.load_config.load_format = load_format
+    engram_config.engram_config.dp_shared_memory = shared
+    expectation = pytest.raises(ValueError, match="set dp_shared_memory=false") if rejected else nullcontext()
+    with expectation:
         _validate_engram_config(engram_config)
 
 
