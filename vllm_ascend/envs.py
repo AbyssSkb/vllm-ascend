@@ -36,6 +36,9 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Resolve mounted checkpoint weights through model-manager during loading.
+    # Default: 0 (disabled). Valid values: 0 or 1. This switch is not sensitive.
+    "VLLM_ASCEND_ASYNC_MODEL_MOUNT": lambda: _strict_binary_env("VLLM_ASCEND_ASYNC_MODEL_MOUNT"),
     # Attach readable model metadata to RFork planner requests; default: 0.
     # Valid values: 0, 1, true, false (case-insensitive, whitespace ignored).
     # This switch is non-sensitive; enabled headers carry model identifiers in plain text.

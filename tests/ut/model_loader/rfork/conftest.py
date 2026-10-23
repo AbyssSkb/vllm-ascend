@@ -162,6 +162,7 @@ def rfork_helpers(monkeypatch, local_weights):
     install("vllm.model_executor.layers.rotary_embedding", _ROPE_DICT=rope_dict)
 
     package("vllm_ascend")
+    install("vllm_ascend.envs", VLLM_ASCEND_ASYNC_MODEL_MOUNT=False)
     package("vllm_ascend.models")
 
     class AscendDeepSeekMTP(Module):

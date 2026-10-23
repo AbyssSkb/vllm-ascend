@@ -15,6 +15,8 @@ DEFAULT_RFORK_REQUEST_TIMEOUT_SEC = 10.0
 DEFAULT_RFORK_HEARTBEAT_INTERVAL_SEC = 30.0
 DEFAULT_RFORK_LEASE_RELEASE_MAX_ATTEMPTS = 3
 DEFAULT_RFORK_LEASE_RELEASE_RETRY_INTERVAL_SEC = 30.0
+DEFAULT_RFORK_SEED_RETRY_INTERVAL_SEC = 1.0
+DEFAULT_RFORK_SOURCE_WAIT_TIMEOUT_SEC = 600.0
 
 
 def _string_value(
@@ -67,10 +69,17 @@ class RForkConfig:
     lease_release_retry_interval_sec: float = DEFAULT_RFORK_LEASE_RELEASE_RETRY_INTERVAL_SEC
     send_model_identity_headers: bool = False
     seed_removal_supported: bool | None = False
+    seed_retry_interval_sec: float = DEFAULT_RFORK_SEED_RETRY_INTERVAL_SEC
+    source_wait_timeout_sec: float = DEFAULT_RFORK_SOURCE_WAIT_TIMEOUT_SEC
 
     def __post_init__(self) -> None:
-        # Heartbeat and release retry settings are JSON-only; reject invalid types and ranges.
-        for name in ("heartbeat_interval_sec", "lease_release_retry_interval_sec"):
+        # Operational settings are JSON-only; reject typos instead of using similar environment variables.
+        for name in (
+            "heartbeat_interval_sec",
+            "lease_release_retry_interval_sec",
+            "seed_retry_interval_sec",
+            "source_wait_timeout_sec",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or _positive_float(value) is None:
                 raise ValueError(f"rfork_{name} must be a finite positive JSON number")
@@ -112,6 +121,8 @@ class RForkConfig:
             send_model_identity_headers = model_identity_headers in {"1", "true"}
 
         return cls(
+            seed_retry_interval_sec=config.get("rfork_seed_retry_interval_sec", DEFAULT_RFORK_SEED_RETRY_INTERVAL_SEC),
+            source_wait_timeout_sec=config.get("rfork_source_wait_timeout_sec", DEFAULT_RFORK_SOURCE_WAIT_TIMEOUT_SEC),
             send_model_identity_headers=send_model_identity_headers,
             seed_removal_supported=config.get("rfork_seed_removal_supported", False),
             heartbeat_interval_sec=config.get("rfork_heartbeat_interval_sec", DEFAULT_RFORK_HEARTBEAT_INTERVAL_SEC),

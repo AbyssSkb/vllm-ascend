@@ -76,6 +76,8 @@ fix the initialization error and restart the worker.
 | **rfork_scheduler_url** | String | Base URL of the planner service used for seed allocation, release, and heartbeat. | Required for planner-based matching. Example: `http://127.0.0.1:1223`. |
 | **rfork_seed_timeout_sec** | Number | Timeout for waiting until the local seed HTTP service becomes healthy after startup. | Optional. Default: `5.0`. Must be finite and greater than `0`. A valid JSON value takes priority over `RFORK_SEED_TIMEOUT_SEC`; an invalid or absent JSON value uses a valid environment value, otherwise the default. |
 | **rfork_request_timeout_sec** | Number | HTTP connect/read timeout for planner and seed requests. | Optional. Default: `10.0`. Must be finite and greater than `0`. A valid JSON value takes priority over `RFORK_REQUEST_TIMEOUT_SEC`; an invalid or absent JSON value uses a valid environment value, otherwise the default. |
+| **rfork_seed_retry_interval_sec** | Number | Delay between seed lookups while racing async model mount. | Optional. Default: `1.0`. Must be a finite positive JSON number. Used only with async model mount enabled. |
+| **rfork_source_wait_timeout_sec** | Number | Total budget for waiting for a compatible seed or mounted weights, starting when the mount task starts. | Optional. Default: `600.0`. Must be a finite positive JSON number. Used only with async model mount enabled. |
 | **rfork_model_identity_headers** | Boolean | Attach readable model identity headers to every planner request. | Optional. Default: `false`. Explicit JSON `true` or `false` overrides `RFORK_MODEL_IDENTITY_HEADERS`; otherwise the environment variable accepts `0`, `1`, `true`, or `false`, ignoring case and surrounding whitespace. |
 | **rfork_heartbeat_interval_sec** | Number | Interval between planner heartbeat reports. | Optional. Default: `30.0`. JSON configuration only. Must be a finite positive number; invalid values fail configuration initialization. |
 | **rfork_lease_release_max_attempts** | Integer | Fast-attempt count before transient lease-release failures continue at a slower background interval. | Optional. Default: `3`. JSON configuration only. Must be a positive integer; invalid values fail configuration initialization. Permanent planner rejection still stops retries. |
@@ -93,6 +95,113 @@ outside the ephemeral range `32768-60999`); invalid values fall back to OS assig
 the seed HTTP ports and the HIXL endpoint range. The HIXL data-plane endpoints default to base port `22000`
 (`YR_TE_HIXL_BASE_PORT`, 100 ports per physical device), which stays clear of Mooncake ADXL's default `20000`-based
 segments on nodes that co-locate both engines.
+
+### Asynchronous Model Mount
+
+Set `VLLM_ASCEND_ASYNC_MODEL_MOUNT=1` to start resolving the full weight directory in a background thread while RFork prepares the receiver. The switch defaults to `0` and accepts only `0` or `1`. When disabled, RFork retains its single seed lookup and existing fallback behavior.
+
+Install and configure an external manager exposing `model_manager.apis.get_model_path_from_manager(with_weights=True)`. This optional Python function blocks until it can return a nonempty local directory path containing the complete checkpoint. vLLM Ascend calls the function; downloading and mounting remain the manager's responsibility. The returned directory can be a remote filesystem mount or a local copy.
+
+Pass an already available **bootstrap directory** to `vllm serve`. It must contain the same checkpoint's configuration, tokenizer resources, quantization descriptions, and any required custom code or templates. Keep it available for the process lifetime: tokenizer configuration continues to reference it. The manager must guarantee that the bootstrap and complete directory identify the same checkpoint version; directory existence alone cannot verify weight contents. Mounted paths are used through local configuration copies, preserving the logical `model_url`, deployment identity, and tokenizer configuration.
+
+The selection rules are:
+
+- After a seed miss, keep making bounded planner requests until a compatible seed or mounted directory is ready, or the source deadline expires. Each participating rank needs its own compatible lease for RFork, or its own complete directory for mounted loading; directory paths may differ across nodes. Loading threads coordinate through the participating CPU groups, including PP for the target and only the active draft participants for MTP.
+- Choose one source for all participants. When both sources are ready, RFork wins regardless of which became ready first. If the directory is ready but not all participants have a usable seed, mounted loading wins after any required post-mount seed lookup; unused leases are returned through the existing cleanup path. An acquired lease is retained and renewed while other ranks catch up.
+- If mounting fails, continue looking for a seed until the deadline. If RFork transfer fails, release registered memory and wait for the same mount task within its original deadline. Failed memory cleanup aborts loading before a second model can be allocated. No usable source produces an explicit error instead of loading weights from bootstrap.
+
+`rfork_source_wait_timeout_sec` covers source waiting, not an RFork transfer already selected. Transfer failure does not start another waiting budget. Planner requests use the smaller of the request timeout and remaining budget, but an in-flight synchronous request cannot be interrupted by mount completion. HTTP connect/read timeouts are not a strict wall-clock bound. A manager without a cancellation interface can leave its daemon thread running after timeout or RFork success; it never operates on the RFork session or NPU, and late results are ignored.
+
+The switch also makes ordinary non-RFork loading wait for the complete directory, with a fixed `600` second budget and coordinated error propagation across its CPU participant groups, and applies to RFork bypass paths. Same-checkpoint MTP is supported, including an RFork main model with an explicitly configured ordinary draft loader, which reuses the main model's mount task and deadline. An independent draft checkpoint is rejected because the manager's boolean-only interface cannot select a second model. `AscendDeepSeekMTP` needs safetensors headers to establish head ownership and therefore safely waits for the complete directory before preparation. After preparation, unless all weights can be reused from the target, it makes one compatible-seed lookup within the original remaining budget: a usable seed supplies the weights; otherwise, loading uses the mounted directory. No lookup is made if the budget has already expired. `DeepSeekV4MTP` is a different class and does not require that preparation step.
+
+Models with active Engram layers (`engram_config` and nonempty `engram_layer_ids` in the Hugging Face text or model configuration) must wait for the complete directory before model construction, even with CPU offload disabled: construction reads the checkpoint index and shard headers and binds the physical directory. They cannot start from a seed while mounting is pending. After construction and local table loading, RFork still makes one compatible-seed lookup within the original remaining budget: a seed supplies the NPU weights; otherwise, loading falls back to the already mounted directory. With CPU offload enabled, host tables still load locally; fallback releases host allocations only after registered-memory cleanup succeeds, and a partial host-table construction failure aborts loading across the participating ranks.
+
+#### Run the Regression Tests
+
+From the repository root, run these tests in a development environment with matching vLLM and Ascend dependencies:
+
+```shell
+pytest --confcutdir=tests/ut/model_loader/rfork \
+  tests/ut/model_loader/rfork/test_async_mount.py \
+  tests/ut/model_loader/rfork/test_async_mount_loader.py \
+  tests/ut/model_loader/rfork/test_async_mount_draft.py \
+  tests/ut/model_loader/rfork/test_source_race.py \
+  tests/ut/model_loader/rfork/test_seed_acquisition_timeout.py -q
+```
+
+These isolated CPU tests cover source selection, deadlines, configuration handling, and failure cleanup. NPU transfer and output accuracy require the hardware checks below.
+
+#### Validate the Two Race Outcomes on NPU
+
+Use a model that fits the chosen devices and the same TP/PP topology for seed and receiver. To validate B while mounting is pending, choose a model whose RFork construction and layout preparation need no checkpoint headers; active Engram models and `AscendDeepSeekMTP` require the complete directory first. The single-rank commands below use separate devices for the two instances. These are hardware validation steps; CPU unit tests do not establish transfer accuracy.
+
+With the separately supplied mock manager available on `PYTHONPATH`, run this setup once and reuse the same values in the terminals used below:
+
+```shell
+export PYTHONPATH="/path/to/async_model_mount_mock:${PYTHONPATH}"
+export VLLM_ASCEND_ASYNC_MODEL_MOUNT=1
+export BOOTSTRAP_MODEL="/path/to/bootstrap"
+export MOCK_MODEL_WEIGHT_PATH="/path/to/complete/checkpoint"
+export MOCK_MODEL_MOUNT_TIMEOUT_SEC=600
+export MOCK_MODEL_MOUNT_POLL_INTERVAL_SEC=1
+export ASYNC_MOUNT_TEST_DIR="$(mktemp -d)"
+export RECEIVER_READY="${ASYNC_MOUNT_TEST_DIR}/receiver.ready"
+export SEED_READY="${ASYNC_MOUNT_TEST_DIR}/seed.ready"
+export RFORK_CONFIG='{
+  "model_url": "async-mount-checkpoint-v1",
+  "model_deploy_strategy_name": "async-mount-test",
+  "rfork_scheduler_url": "http://127.0.0.1:1223",
+  "rfork_seed_retry_interval_sec": 1.0,
+  "rfork_source_wait_timeout_sec": 600.0
+}'
+```
+
+Share the same generated ready-file paths between terminals. Start an empty planner:
+
+```shell
+python examples/rfork/rfork_planner.py --host 0.0.0.0 --port 1223
+```
+
+**A. Mount wins with no seed.** Start the receiver with its ready file absent:
+
+```shell
+ASCEND_RT_VISIBLE_DEVICES=0 MOCK_MODEL_READY_FILE="${RECEIVER_READY}" \
+vllm serve "${BOOTSTRAP_MODEL}" --tensor-parallel-size 1 \
+  --served-model-name async-mount-test --port 8001 \
+  --load-format rfork --model-loader-extra-config "${RFORK_CONFIG}"
+```
+
+After the receiver logs `Initial RFork seed lookup failed`, create its signal from another terminal:
+
+```shell
+touch "${RECEIVER_READY}"
+```
+
+Expect `Async model mount won RFork fallback race.`, followed by `RFork fallback uses async mounted model path` naming the complete directory, successful startup, and correct inference output.
+
+**B. A late seed wins.** Stop the A receiver and restart the planner without its old advertisement. Use a fresh test directory, keep `RECEIVER_READY` absent, and start the receiver with the same command. After its first seed miss, make only the seed's mount ready and start a compatible seed on a separate device:
+
+```shell
+touch "${SEED_READY}"
+ASCEND_RT_VISIBLE_DEVICES=1 MOCK_MODEL_READY_FILE="${SEED_READY}" \
+vllm serve "${BOOTSTRAP_MODEL}" --tensor-parallel-size 1 \
+  --served-model-name async-mount-test --port 8000 \
+  --load-format rfork --model-loader-extra-config "${RFORK_CONFIG}"
+```
+
+Leave the receiver's signal absent. Once the seed publishes itself, expect the receiver to log `RFork seed retry won fallback race.`, complete loading with `source=transfer`, and produce correct inference output. The two independent ready files are essential: sharing one would make both mounts ready and invalidate this check. Increase the source and mock timeouts together if seed startup needs more than `600` seconds.
+
+After the receiver starts in each scenario, send the same greedy completion request:
+
+```shell
+curl --fail --silent --show-error http://127.0.0.1:8001/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"async-mount-test","prompt":"The capital of France is","temperature":0,"max_tokens":16}'
+```
+
+Compare `choices[0].text` against a reference instance loaded from the complete checkpoint with `VLLM_ASCEND_ASYNC_MODEL_MOUNT=0` and `--load-format auto`, using the same model, quantization, TP/PP settings, and request. Successful startup or an HTTP response establishes availability; matching the reference output checks the loaded weights for this smoke case.
+
+For a separate Engram test, add `--engram-config '{"cpu_offload":true,"dp_shared_memory":false}'` to both seed and receiver, make the complete directory ready before construction, and verify local host-table loading followed by `source=transfer` for the NPU weights. This test requires mounted weights before seed selection, as described above; pending-mount scenario B applies only to models without that dependency.
 
 ### Optional Planner Model Identity Headers
 

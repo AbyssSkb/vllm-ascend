@@ -42,6 +42,7 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+from vllm_ascend import envs
 from vllm_ascend import utils as ascend_utils
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
@@ -354,17 +355,36 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         draft_vllm_config = self._create_draft_vllm_config()
         draft_load_config = self.speculative_config.draft_load_config
+        draft_model_config = self.speculative_config.draft_model_config
+        model_load_context = nullcontext()
+        if (
+            envs.VLLM_ASCEND_ASYNC_MODEL_MOUNT
+            and self.vllm_config.load_config.load_format == "rfork"
+            and draft_load_config is not None
+            and draft_load_config.load_format != "rfork"
+        ):
+            from vllm_ascend.model_loader.async_mount import mounted_model_config, validate_async_mount_model
+            from vllm_ascend.model_loader.rfork.source_race import RForkLoadCoordinator
+
+            coordinator = RForkLoadCoordinator(draft_vllm_config, is_draft=True)
+            with coordinator.phase("draft mounted directory"):
+                validate_async_mount_model(self.vllm_config, draft_model_config)
+                path = self.vllm_config.load_config.async_model_mount.wait()
+                draft_vllm_config, draft_model_config = mounted_model_config(
+                    draft_vllm_config, draft_model_config, path
+                )
+            model_load_context = coordinator.phase("mounted draft loading")
         logger.info(
             "[spec_decode/base] Loading draft model: method=%s, load_format=%s, model=%s",
             self.method,
             getattr(draft_load_config, "load_format", None),
             getattr(self.speculative_config.draft_model_config, "model", None),
         )
-        with set_model_tag("eagle_head"):
+        with model_load_context, set_model_tag("eagle_head"):
             model = get_model(
                 vllm_config=draft_vllm_config,
-                model_config=self.speculative_config.draft_model_config,
-                load_config=self.speculative_config.draft_load_config,
+                model_config=draft_model_config,
+                load_config=draft_load_config,
             )
             self._maybe_remove_d2t(model)
 

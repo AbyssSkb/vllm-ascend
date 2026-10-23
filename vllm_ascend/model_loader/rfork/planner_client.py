@@ -134,8 +134,20 @@ class RForkPlannerClient:
         self._rejected_seed_lease = None
         return lease
 
-    def acquire_seed(self) -> SeedLease | None:
+    def acquire_seed(self, timeout_sec: float | None = None) -> SeedLease | None:
+        if timeout_sec is not None and (
+            isinstance(timeout_sec, bool)
+            or not isinstance(timeout_sec, (int, float))
+            or not math.isfinite(timeout_sec)
+            or timeout_sec <= 0
+        ):
+            raise ValueError("seed acquisition timeout_sec must be a finite positive number")
+        request_timeout = (
+            self.request_timeout_sec if timeout_sec is None else min(self.request_timeout_sec, timeout_sec)
+        )
         if self._rejected_seed_lease is not None:
+            if timeout_sec is not None:
+                return None
             result = self.release_seed_once(self._rejected_seed_lease)
             if result is not LeaseReleaseResult.RELEASED:
                 return None
@@ -146,7 +158,7 @@ class RForkPlannerClient:
             response = requests.get(
                 f"{self.planner_url}/get_seed",
                 headers=self._with_model_identity_headers({"SEED_KEY": self.seed_key}),
-                timeout=self.request_timeout_sec,
+                timeout=request_timeout,
                 allow_redirects=False,
             )
             if response.status_code == 404:
@@ -199,14 +211,19 @@ class RForkPlannerClient:
         except (requests.RequestException, RuntimeError, ValueError) as exc:
             logger.warning("RFork planner seed acquisition failed: %s", exc)
             if lease_for_release is not None:
-                result = self.release_seed_once(lease_for_release)
-                if result is not LeaseReleaseResult.RELEASED:
+                if timeout_sec is not None:
+                    # The session releases asynchronously so PUT cannot exceed the lookup budget.
                     self._rejected_seed_lease = lease_for_release
-                    logger.warning(
-                        "RFork rejected a seed lease but could not return its planner allocation: lease=%s result=%s",
-                        lease_log_id(lease_for_release),
-                        result.name,
-                    )
+                else:
+                    result = self.release_seed_once(lease_for_release)
+                    if result is not LeaseReleaseResult.RELEASED:
+                        self._rejected_seed_lease = lease_for_release
+                        logger.warning(
+                            "RFork rejected a seed lease but could not return its planner allocation: "
+                            "lease=%s result=%s",
+                            lease_log_id(lease_for_release),
+                            result.name,
+                        )
             return None
 
     def release_seed_once(self, lease: SeedLease) -> LeaseReleaseResult:

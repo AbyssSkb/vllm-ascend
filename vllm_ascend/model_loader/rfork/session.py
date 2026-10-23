@@ -4,6 +4,7 @@
 # you may not use this file except in compliance with the License.
 
 import atexit
+import math
 import threading
 import time
 from typing import Any
@@ -136,7 +137,14 @@ class RForkSession:
             )
             return True
 
-    def acquire_seed(self) -> bool:
+    def acquire_seed(self, timeout_sec: float | None = None) -> bool:
+        if timeout_sec is not None and (
+            isinstance(timeout_sec, bool)
+            or not isinstance(timeout_sec, (int, float))
+            or not math.isfinite(timeout_sec)
+            or timeout_sec <= 0
+        ):
+            raise ValueError("seed acquisition timeout_sec must be a finite positive number")
         with self._lock:
             if self.lease_release_stop_event.is_set():
                 return False
@@ -150,7 +158,11 @@ class RForkSession:
                 logger.error("RFork seed acquisition requires registered buffers; state=%s", self.state.name)
                 return False
             acquisition_started = time.monotonic()
-            self.seed_lease = self.planner.acquire_seed()
+            self.seed_lease = (
+                self.planner.acquire_seed()
+                if timeout_sec is None
+                else self.planner.acquire_seed(timeout_sec=timeout_sec)
+            )
             if self.seed_lease is None:
                 self.seed_lease = self.planner.take_rejected_lease()
                 if self.seed_lease is not None:
@@ -205,7 +217,17 @@ class RForkSession:
         )
         try:
             while not stop_event.wait(interval):
-                self.planner.renew_seed_once(lease)
+                try:
+                    renewed = self.planner.renew_seed_once(lease)
+                except Exception:
+                    logger.exception("RFork lease renewal raised; the seed lease is no longer confirmed.")
+                    renewed = False
+                if not renewed:
+                    with self._lock:
+                        if self.seed_lease is lease and self.state is RForkLifecycleState.LEASED:
+                            self.state = RForkLifecycleState.CLEANUP_REQUIRED
+                            logger.warning("RFork lease renewal was not confirmed; refusing transfer from this seed.")
+                    return
         finally:
             with self._lock:
                 if self.lease_renew_thread is threading.current_thread():

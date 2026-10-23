@@ -835,16 +835,30 @@ class NPUWorker(WorkerBase):
         return output
 
     def load_model(self) -> None:
+        model_mount_context = nullcontext()
+        model_load_context = nullcontext()
+        if envs_ascend.VLLM_ASCEND_ASYNC_MODEL_MOUNT and self.vllm_config.load_config.load_format != "rfork":
+            from vllm_ascend.model_loader.async_mount import (
+                AsyncModelMount,
+                mounted_model_context,
+                validate_async_mount_model,
+            )
+            from vllm_ascend.model_loader.rfork.source_race import RForkLoadCoordinator
+
+            coordinator = RForkLoadCoordinator(self.vllm_config, is_draft=False)
+            with coordinator.phase("async mounted directory"):
+                validate_async_mount_model(self.vllm_config)
+                model_mount_context = mounted_model_context(self, AsyncModelMount().wait())
+            model_load_context = coordinator.phase("mounted model loading")
+
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
             assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
             context = allocator.use_memory_pool(tag="weights")
         else:
-            from contextlib import nullcontext
-
             context = nullcontext()  # type: ignore
 
-        with context, set_current_vllm_config(self.vllm_config):
+        with model_load_context, model_mount_context, context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
 
         if self.vllm_config.weight_transfer_config is not None:
