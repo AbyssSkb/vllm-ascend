@@ -17,10 +17,13 @@
 """Allow Engram on Ascend and host table sharing across PCP replicas."""
 
 import importlib.util
+from copy import copy
 
 # Older vLLM builds have no Engram config to patch.
 if importlib.util.find_spec("vllm.config.engram") is not None:
     from vllm.config.engram import EngramConfig, model_has_engram_layers
+
+    _ORIGINAL_VERIFY_LOAD_CONFIG = EngramConfig.verify_load_config
 
     def verify_model_config(self, model_config) -> None:
         # Keep upstream's model/layer checks; only its CUDA requirement is lifted.
@@ -41,5 +44,13 @@ if importlib.util.find_spec("vllm.config.engram") is not None:
         if self.embedding_across_dp and parallel_config.data_parallel_size > 1 and parallel_config.enable_elastic_ep:
             raise ValueError("Engram embedding_across_dp is not supported with elastic EP yet.")
 
+    def verify_load_config(self, load_config) -> None:
+        if load_config.load_format == "rfork":
+            # RFork's local fallback uses the safetensors parameter callbacks.
+            load_config = copy(load_config)
+            load_config.load_format = "safetensors"
+        _ORIGINAL_VERIFY_LOAD_CONFIG(self, load_config)
+
     EngramConfig.verify_model_config = verify_model_config
     EngramConfig.verify_parallel_config = verify_parallel_config
+    EngramConfig.verify_load_config = verify_load_config
