@@ -4,8 +4,9 @@
 import builtins
 import importlib.util
 import runpy
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -23,6 +24,44 @@ def test_engram_patch_is_noop_without_upstream_config(monkeypatch):
     root = Path(__file__).resolve().parents[4]
     namespace = runpy.run_path(str(root / "vllm_ascend/patch/platform/patch_engram_config.py"))
     assert "verify_model_config" not in namespace
+
+
+@pytest.mark.parametrize(
+    "load_format,shared,rejected",
+    [("rfork", True, False), ("rfork", False, False), ("safetensors", True, False), ("dummy", True, True)],
+)
+def test_rfork_engram_load_validation_without_vllm(monkeypatch, load_format, shared, rejected):
+    validated_configs = []
+
+    class EngramConfig:
+        def verify_load_config(self, load_config):
+            validated_configs.append(load_config)
+            if self.dp_shared_memory and load_config.load_format not in ("auto", "safetensors", "pt"):
+                raise ValueError("unsupported shared loader")
+
+    module = ModuleType("vllm.config.engram")
+    module.EngramConfig = EngramConfig
+    module.model_has_engram_layers = lambda config: True
+    monkeypatch.setitem(sys.modules, "vllm.config.engram", module)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: module)
+    root = Path(__file__).resolve().parents[4]
+    runpy.run_path(str(root / "vllm_ascend/patch/platform/patch_engram_config.py"))
+
+    engram_config = EngramConfig()
+    engram_config.dp_shared_memory = shared
+    load_config = SimpleNamespace(load_format=load_format)
+    if rejected:
+        with pytest.raises(ValueError, match="unsupported shared loader"):
+            engram_config.verify_load_config(load_config)
+    else:
+        engram_config.verify_load_config(load_config)
+    assert load_config.load_format == load_format
+    assert len(validated_configs) == 1
+    if load_format == "rfork":
+        assert validated_configs[0] is not load_config
+        assert validated_configs[0].load_format == "safetensors"
+    else:
+        assert validated_configs[0] is load_config
 
 
 @pytest.fixture
@@ -107,6 +146,21 @@ def test_ascend_engram_limits(engram_config, section, field, value, error):
     with pytest.raises(ValueError, match=error):
         VllmConfig._resolve_and_verify_engram_config(engram_config)
         _validate_engram_config(engram_config)
+
+
+@pytest.mark.parametrize(
+    "load_format,shared",
+    [("rfork", True), ("rfork", False), ("safetensors", True)],
+)
+def test_rfork_engram_shared_memory(engram_config, load_format, shared):
+    from vllm.config import VllmConfig
+
+    from vllm_ascend.platform import _validate_engram_config
+
+    engram_config.load_config.load_format = load_format
+    engram_config.engram_config.dp_shared_memory = shared
+    VllmConfig._resolve_and_verify_engram_config(engram_config)
+    _validate_engram_config(engram_config)
 
 
 def test_engram_patch_retains_layer_check(engram_config):
