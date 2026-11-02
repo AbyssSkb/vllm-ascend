@@ -110,15 +110,97 @@ def test_collector_deduplicates_exact_same_logical_tensor(tensor_runtime, monkey
 
 def test_collector_rejects_conflicting_same_name_view(tensor_runtime, monkeypatch):
     storage = torch.arange(8, dtype=torch.float32)
-    small = storage[:2]
-    large = storage[:5]
-    collected: list[tuple[str, torch.Tensor]] = []
-    seen_names: dict[str, int] = {}
+    model = nn.Module()
+    model.register_buffer("weight", storage[:2])
+    model.__dict__["weight"] = storage[:5]
     monkeypatch.setattr(tensor_runtime.tensor_layout, "is_transferable_tensor", lambda _tensor: True)
 
-    with pytest.raises(ValueError, match="conflicting tensor entries"):
-        tensor_runtime.tensor_layout._try_collect("weight", small, seen_names, collected)
-        tensor_runtime.tensor_layout._try_collect("weight", large, seen_names, collected)
+    with pytest.raises(ValueError, match="one tensor ID label"):
+        tensor_runtime.tensor_layout.collect_processed_layout_tensors(model)
+
+
+@pytest.mark.parametrize("processed_layout", [False, True])
+def test_collector_prefers_registered_tensor_and_keeps_distinct_views(tensor_runtime, monkeypatch, processed_layout):
+    model = nn.Module()
+    model.layer = nn.Module()
+    model.layer.weight = nn.Parameter(torch.arange(4, dtype=torch.float32).reshape(2, 2))
+    model.impl = SimpleNamespace(
+        alias=model.layer.weight.data,
+        transposed=model.layer.weight.data.t(),
+        reshaped=model.layer.weight.data.view(4),
+    )
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_transferable_tensor", lambda _tensor: True)
+
+    collected = dict(tensor_runtime.tensor_layout.collect_transferable_tensors(model, processed_layout))
+
+    assert set(collected) == {"layer.weight", "impl.transposed", "impl.reshaped"}
+    assert collected["layer.weight"] is model.layer.weight
+    assert collected["impl.transposed"].stride() != model.layer.weight.stride()
+    assert collected["impl.reshaped"].shape != model.layer.weight.shape
+
+
+@pytest.mark.parametrize("processed_layout", [False, True])
+def test_collector_scans_shared_diamond_once(tensor_runtime, monkeypatch, processed_layout):
+    accesses = []
+
+    class Node:
+        def __getattribute__(self, name):
+            if name == "__dict__":
+                accesses.append(id(self))
+            return super().__getattribute__(name)
+
+    node = Node()
+    node.weight = torch.ones(2)
+    for _ in range(12):
+        parent = Node()
+        parent.left = node
+        parent.right = node
+        node = parent
+    node.loop = node
+    model = nn.Module()
+    model.impl = node
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_transferable_tensor", lambda _tensor: True)
+
+    collected = tensor_runtime.tensor_layout.collect_transferable_tensors(model, processed_layout)
+
+    assert [name for name, _ in collected] == ["impl" + ".left" * 12 + ".weight"]
+    assert len(accesses) < 80
+
+
+def test_collector_uses_stable_typed_container_keys(tensor_runtime, monkeypatch):
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_transferable_tensor", lambda _tensor: True)
+
+    def collect(reverse):
+        entries = [(1, torch.ones(1)), ("1", torch.ones(2)), ("a.b", torch.ones(3))]
+        if reverse:
+            entries.reverse()
+        model = nn.Module()
+        model.impl = SimpleNamespace(weights=dict(entries))
+        return {
+            name: tuple(tensor.shape)
+            for name, tensor in tensor_runtime.tensor_layout.collect_transferable_tensors(model, True)
+        }
+
+    expected = {"impl.weights[1]": (1,), 'impl.weights["1"]': (2,), 'impl.weights["a.b"]': (3,)}
+    assert collect(False) == collect(True) == expected
+
+
+def test_collector_rejects_ambiguous_container_keys(tensor_runtime, monkeypatch):
+    model = nn.Module()
+    model.impl = {float("nan"): torch.ones(2), float("nan"): torch.ones(3)}
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_transferable_tensor", lambda _tensor: True)
+
+    with pytest.raises(ValueError, match="one tensor ID label"):
+        tensor_runtime.tensor_layout.collect_transferable_tensors(model, True)
+
+
+def test_collector_rejects_gapped_tensor_layout(tensor_runtime, monkeypatch):
+    model = nn.Module()
+    model.impl = SimpleNamespace(weight=torch.arange(8)[::2])
+    monkeypatch.setattr(tensor_runtime.tensor_layout, "is_transferable_tensor", lambda _tensor: True)
+
+    with pytest.raises(ValueError, match="gapped or overlapping storage"):
+        tensor_runtime.tensor_layout.collect_transferable_tensors(model, True)
 
 
 def test_collector_scans_custom_callable_impl_and_skips_function(tensor_runtime, monkeypatch):
