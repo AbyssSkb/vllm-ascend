@@ -409,7 +409,7 @@ def get_linear_quant_type(
     if proj_name in packed_modules_mapping:
         quant_type = None
         shard_prefixes = [
-            prefix.replace(proj_name, shard_proj_name) for shard_proj_name in packed_modules_mapping[proj_name]
+            prefix.removesuffix(proj_name) + shard_proj_name for shard_proj_name in packed_modules_mapping[proj_name]
         ]
         for shard_prefix in shard_prefixes:
             shard_key = shard_prefix + ".weight"
@@ -430,7 +430,7 @@ def get_linear_quant_type(
                 logger.error(err_msg)
                 raise ValueError(err_msg)
     else:
-        quant_type = quant_description[prefix + ".weight"]
+        quant_type = quant_description.get(prefix + ".weight")
     return quant_type
 
 
@@ -471,6 +471,7 @@ def create_scheme_for_layer(
     prefix: str,
     layer_type: str,
     packed_modules_mapping: dict[str, Any] | None = None,
+    quant_type: str | None = None,
 ):
     """Create a quantization scheme instance for a layer.
 
@@ -484,7 +485,8 @@ def create_scheme_for_layer(
         An instance of the appropriate quantization scheme class.
     """
     logger.info_once("Using the vLLM Ascend modelslim Quantization now!")
-    quant_type = get_quant_type_for_layer(quant_description, prefix, layer_type, packed_modules_mapping)
+    if quant_type is None:
+        quant_type = get_quant_type_for_layer(quant_description, prefix, layer_type, packed_modules_mapping)
 
     if quant_type is None:
         err_msg = f"Could not determine quantization type for layer {prefix} (layer_type={layer_type})."
@@ -709,13 +711,16 @@ class AscendModelSlimConfig(QuantizationConfig):
                 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 
                 return AscendUnquantizedLinearMethod()
-            if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
+            quant_type = get_linear_quant_type(self.quant_description, prefix, self.packed_modules_mapping)
+            if quant_type is None or quant_type == "FLOAT":
                 # Delayed import to avoid circular import
                 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 
                 logger.debug("Select AscendUnquantizedLinearMethod for %s (layer=%s)", prefix, "LinearBase")
                 return AscendUnquantizedLinearMethod()
-            scheme = create_scheme_for_layer(self.quant_description, prefix, "linear", self.packed_modules_mapping)
+            scheme = create_scheme_for_layer(
+                self.quant_description, prefix, "linear", self.packed_modules_mapping, quant_type
+            )
             logger.debug("Select AscendLinearMethod for %s (layer=%s)", prefix, "LinearBase")
             return AscendLinearMethod(scheme)
         elif isinstance(layer, AttentionLayerBase) and (
@@ -730,58 +735,34 @@ class AscendModelSlimConfig(QuantizationConfig):
             logger.debug("Select AscendKVCacheMethod(C8) for %s (layer=%s)", prefix, "AttentionLayerBase[C8]")
             return AscendKVCacheMethod(AscendC8KVCacheAttentionMethod(self.quant_description, prefix))
         elif _is_fused_moe_layer(layer):
-            if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
+            quant_type = get_linear_quant_type(self.quant_description, prefix, self.packed_modules_mapping)
+            if quant_type is None or quant_type == "FLOAT":
                 # Delayed import to avoid circular import
                 from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 
                 logger.debug("Select AscendUnquantizedFusedMoEMethod for %s (layer=%s)", prefix, "FusedMoE")
                 return AscendUnquantizedFusedMoEMethod(layer.moe_config)
-            scheme = create_scheme_for_layer(self.quant_description, prefix, "moe", self.packed_modules_mapping)
+            scheme = create_scheme_for_layer(
+                self.quant_description, prefix, "moe", self.packed_modules_mapping, quant_type
+            )
             logger.debug("Select AscendFusedMoEMethod for %s (layer=%s)", prefix, "FusedMoE")
             return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid)
         elif isinstance(layer, VocabParallelEmbedding):
-            if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
+            quant_type = get_linear_quant_type(self.quant_description, prefix, self.packed_modules_mapping)
+            if quant_type is None or quant_type == "FLOAT":
                 logger.debug("Select UnquantizedEmbeddingMethod for %s (layer=%s)", prefix, "VocabParallelEmbedding")
                 return UnquantizedEmbeddingMethod()
-            scheme = create_scheme_for_layer(self.quant_description, prefix, "linear", self.packed_modules_mapping)
+            scheme = create_scheme_for_layer(
+                self.quant_description, prefix, "linear", self.packed_modules_mapping, quant_type
+            )
             logger.debug("Select AscendEmbeddingMethod for %s (layer=%s)", prefix, "VocabParallelEmbedding")
             return AscendEmbeddingMethod(scheme)
         logger.debug("No quant method matched for %s, falling back to base", prefix)
         return None
 
     def is_layer_skipped_ascend(self, prefix: str, fused_mapping: Mapping[str, list[str]] = MappingProxyType({})):
-        # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
-        proj_name = prefix.split(".")[-1]
-        if proj_name in fused_mapping:
-            shard_prefixes = [
-                prefix.replace(proj_name, shard_proj_name) for shard_proj_name in fused_mapping[proj_name]
-            ]
-
-            is_skipped = None
-            for shard_prefix in shard_prefixes:
-                shard_key = shard_prefix + ".weight"
-                # Preserve the original failure behavior except for the known
-                # k_eq_v case where v_proj is replicated from k_proj.
-                if shard_key not in self.quant_description and _is_missing_v_shard(shard_key, self.quant_description):
-                    continue
-                is_shard_skipped = self.quant_description[shard_key] == "FLOAT"
-
-                if is_skipped is None:
-                    is_skipped = is_shard_skipped
-                elif is_shard_skipped != is_skipped:
-                    raise ValueError(
-                        f"Detected some but not all shards of {prefix} "
-                        "are quantized. All shards of fused layers "
-                        "to have the same precision."
-                    )
-        else:
-            is_skipped = any(
-                key.startswith(prefix) and key.endswith(".weight") and value == "FLOAT"
-                for key, value in self.quant_description.items()
-            )
-
-        assert is_skipped is not None
-        return is_skipped
+        quant_type = get_linear_quant_type(self.quant_description, prefix, fused_mapping)
+        return quant_type is None or quant_type == "FLOAT"
 
     def is_fa_quant_layer(self, prefix):
         if self.enable_fa_quant:

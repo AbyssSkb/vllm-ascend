@@ -192,7 +192,7 @@ class TestAscendModelSlimConfig(TestBase):
             "experts.0.down_proj",
         ]
 
-    def test_missing_linear_weight_without_gate_capability_does_not_fall_back(self):
+    def test_missing_linear_weight_without_gate_capability_is_unquantized(self):
         config = AscendModelSlimConfig({})
         config.packed_modules_mapping = {}
         text_config = KimiLinearConfig(
@@ -227,13 +227,8 @@ class TestAscendModelSlimConfig(TestBase):
                 "model.layers.0.self_attn.g_a_proj",
             )
 
-        assert not isinstance(method, AscendUnquantizedLinearMethod)
-        create_scheme.assert_called_once_with(
-            {},
-            "model.layers.0.self_attn.g_a_proj",
-            "linear",
-            {},
-        )
+        assert isinstance(method, AscendUnquantizedLinearMethod)
+        create_scheme.assert_not_called()
 
     def test_unknown_model_type_preserves_existing_packed_mapping(self):
         description = {
@@ -275,6 +270,7 @@ class TestAscendModelSlimConfig(TestBase):
             "model.layers.0.mlp.gate_up_proj",
             "linear",
             packed_mapping,
+            "W8A8_DYNAMIC",
         )
 
     @patch("torch.npu.is_available")
@@ -302,7 +298,7 @@ class TestAscendModelSlimConfig(TestBase):
         # Test skipped layer
         with (
             patch("vllm_ascend.quantization.modelslim_config.get_current_vllm_config", return_value=mock_config),
-            patch.object(self.ascend_config, "is_layer_skipped_ascend", return_value=True),
+            patch("vllm_ascend.quantization.modelslim_config.get_linear_quant_type", return_value="FLOAT"),
         ):
             method = self.ascend_config.get_quant_method(linear_layer, ".attn")
             self.assertIsInstance(method, AscendUnquantizedLinearMethod)
@@ -310,7 +306,7 @@ class TestAscendModelSlimConfig(TestBase):
         # Test quantized layer
         mock_scheme = MagicMock()
         with (
-            patch.object(self.ascend_config, "is_layer_skipped_ascend", return_value=False),
+            patch("vllm_ascend.quantization.modelslim_config.get_linear_quant_type", return_value="W8A8_DYNAMIC"),
             patch("vllm_ascend.quantization.modelslim_config.get_current_vllm_config", return_value=mock_config),
             patch("vllm_ascend.quantization.modelslim_config.create_scheme_for_layer", return_value=mock_scheme),
             patch(

@@ -23,6 +23,8 @@ import torch
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.expert_map_manager import determine_expert_map
 
+_LINEAR_EXPERT_MAP_CACHE: dict[tuple[int, int, int], torch.Tensor] = {}
+
 
 def expert_file_to_tensor(expert_map_path, layer_id):
     with open(expert_map_path) as f:
@@ -88,7 +90,20 @@ def init_eplb_config(eplb_config, layer_id, moe_config, mix_placement=False, num
         global_placement, physical_count = expert_file_to_tensor(expert_map_path, layer_id)
         n_redundant = physical_count - n_experts
     elif not eplb_enable:
-        _, expert_map, _ = determine_expert_map(ep_size, moe_config.ep_rank, n_experts)
+        cache_key = (ep_size, moe_config.ep_rank, n_experts)
+        expert_map = _LINEAR_EXPERT_MAP_CACHE.get(cache_key)
+        if expert_map is None:
+            _, expert_map, _ = determine_expert_map(*cache_key)
+            if expert_map is not None:
+                _LINEAR_EXPERT_MAP_CACHE[cache_key] = expert_map
+        if expert_map is None:
+            return None, None, None, 0
+        expert_map = expert_map.clone()
+        try:
+            if torch.npu.is_available():
+                expert_map = expert_map.to(device=f"npu:{torch.npu.current_device()}")
+        except Exception:
+            pass
         return None, expert_map, None, 0
 
     if global_placement is None:
