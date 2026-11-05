@@ -108,8 +108,6 @@ class RForkPlannerClient:
                 raise RuntimeError("RFork seed key requires a bound structural digest")
             self._seed_key = build_seed_key(
                 tp_rank=self.tp_rank,
-                model_url=self.config.model_url,
-                model_deploy_strategy_name=self.config.model_deploy_strategy_name,
                 compatibility_fingerprint=self._compatibility_fingerprint,
                 structural_digest=self._structural_digest,
                 is_draft_model=self._is_draft_model,

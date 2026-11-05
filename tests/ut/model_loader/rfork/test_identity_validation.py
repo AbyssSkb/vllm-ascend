@@ -253,6 +253,18 @@ def test_fingerprint_changes_when_seed_compatibility_changes(identity_module):
     assert _fingerprint(identity_module, revision="rev-b") != _fingerprint(identity_module)
 
 
+@pytest.mark.parametrize("field", ["model_url", "model_deploy_strategy_name"])
+def test_seed_key_changes_with_model_identity(identity_module, field):
+    identity = {"model_url": "model", "model_deploy_strategy_name": "strategy"}
+    fingerprint = identity_module.build_compatibility_fingerprint(_vllm_config(1), _model_config(), **identity)
+    identity[field] += "-other"
+    changed = identity_module.build_compatibility_fingerprint(_vllm_config(1), _model_config(), **identity)
+
+    first = identity_module.build_seed_key(0, fingerprint, "digest")
+    second = identity_module.build_seed_key(0, changed, "digest")
+    assert first != second
+
+
 def test_structural_only_config_fields_do_not_partition_weight_seeds(identity_module):
     # dtype, quantization name, and TP world size only change tensor structure,
     # which the structural digest captures; the config fingerprint stays shared.
@@ -370,8 +382,8 @@ def test_fingerprint_changes_when_rope_configuration_changes(identity_module):
         base_fingerprint = _build_fingerprint(identity_module, base_config)
         changed_fingerprint = _build_fingerprint(identity_module, changed_config)
         assert base_fingerprint != changed_fingerprint, field
-        assert identity_module.build_seed_key(0, "model", "strategy", base_fingerprint, "digest") != (
-            identity_module.build_seed_key(0, "model", "strategy", changed_fingerprint, "digest")
+        assert identity_module.build_seed_key(0, base_fingerprint, "digest") != (
+            identity_module.build_seed_key(0, changed_fingerprint, "digest")
         ), field
 
 
@@ -402,8 +414,8 @@ def test_resolved_commits_isolate_moving_revision_seeds(identity_module):
         first_fingerprint = _build_fingerprint(identity_module, first)
         second_fingerprint = _build_fingerprint(identity_module, second)
         assert first_fingerprint != second_fingerprint, (config_field, commit_field)
-        assert identity_module.build_seed_key(0, "model", "strategy", first_fingerprint, "digest") != (
-            identity_module.build_seed_key(0, "model", "strategy", second_fingerprint, "digest")
+        assert identity_module.build_seed_key(0, first_fingerprint, "digest") != (
+            identity_module.build_seed_key(0, second_fingerprint, "digest")
         ), (config_field, commit_field)
 
 
@@ -540,11 +552,11 @@ def test_moe_data_parallel_ranks_isolate_expert_shard_seed_keys(identity_module,
     monkeypatch.setattr(identity_module, "get_ascend_config", lambda: _ascend_config())
     model_config = _model_config()
     fingerprint = _build_fingerprint(identity_module, model_config, data_parallel_size=2, is_moe_model=True)
-    first_key = identity_module.build_seed_key(0, "model", "strategy", fingerprint, "digest", sharded_dp_rank=0)
-    second_key = identity_module.build_seed_key(0, "model", "strategy", fingerprint, "digest", sharded_dp_rank=1)
+    first_key = identity_module.build_seed_key(0, fingerprint, "digest", sharded_dp_rank=0)
+    second_key = identity_module.build_seed_key(0, fingerprint, "digest", sharded_dp_rank=1)
     assert first_key != second_key
     # Replicated ranks leave the selector None and share the key.
-    replicated_key = identity_module.build_seed_key(0, "model", "strategy", fingerprint, "digest")
+    replicated_key = identity_module.build_seed_key(0, fingerprint, "digest")
     assert replicated_key != first_key
 
 
@@ -878,20 +890,16 @@ def test_seed_port_base_rejects_non_integer_extra_config(config_module, value):
 
 def test_build_seed_key_rejects_missing_identity_values(identity_module):
     build = identity_module.build_seed_key
-    with pytest.raises(RuntimeError, match="model_url"):
-        build(0, "", "strategy", "fingerprint", "digest")
-    with pytest.raises(RuntimeError, match="model_deploy_strategy_name"):
-        build(0, "model", "", "fingerprint", "digest")
     with pytest.raises(RuntimeError, match="compatibility fingerprint"):
-        build(0, "model", "strategy", "", "digest")
+        build(0, "", "digest")
     with pytest.raises(RuntimeError, match="structural digest"):
-        build(0, "model", "strategy", "fingerprint", "")
+        build(0, "fingerprint", "")
 
 
 def test_build_seed_key_changes_with_structural_digest(identity_module):
     fingerprint = _fingerprint(identity_module)
-    first = identity_module.build_seed_key(0, "model", "strategy", fingerprint, "digest-a")
-    second = identity_module.build_seed_key(0, "model", "strategy", fingerprint, "digest-b")
+    first = identity_module.build_seed_key(0, fingerprint, "digest-a")
+    second = identity_module.build_seed_key(0, fingerprint, "digest-b")
     assert first != second
 
 
