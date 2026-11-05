@@ -28,7 +28,6 @@ import vllm_ascend.model_loader.rfork.transfer_backend as transfer_backend
 from vllm_ascend.model_loader.rfork.transfer_backend import (
     RForkTransferBackend,
     _select_weight_blocks,
-    _split_tensors_by_excluded_blocks,
     iter_transfer_chunks,
 )
 from vllm_ascend.model_loader.rfork.types import SeedTransferInfo
@@ -682,18 +681,8 @@ def test_finalize_stops_after_bounded_not_ready_retries(monkeypatch):
     assert sleep_calls == [0.25, 0.25]
 
 
-def test_split_tensors_by_excluded_blocks_separates_shared_storage():
-    storage = torch.arange(10)
-    shared_tensor = storage[:3]
-    own_tensor = torch.arange(4)
-
-    kept_tensors, excluded_names = _split_tensors_by_excluded_blocks(
-        [("model.embed_tokens.weight", shared_tensor), ("layers.0.fc.weight", own_tensor)],
-        [(storage.data_ptr(), shared_tensor.numel() * shared_tensor.element_size())],
-    )
-
-    assert [name for name, _ in kept_tensors] == ["layers.0.fc.weight"]
-    assert excluded_names == ["model.embed_tokens.weight"]
+# Sentinel so tests can pass ``memory_registration_cls=None`` explicitly.
+_UNSET = object()
 
 
 def _make_register_memory_region_backend(
@@ -703,7 +692,9 @@ def _make_register_memory_region_backend(
     stale_blocks=(),
     unregister_error=False,
     register_outcome="ok",
+    memory_registration_cls=_UNSET,
 ):
+    """Build a backend with configurable registration failures and engine capabilities."""
     registrations: list[tuple[int, int, int, int]] = []
     unregistered_calls = []
     monkeypatch.setattr(
@@ -733,11 +724,13 @@ def _make_register_memory_region_backend(
         return SimpleNamespace(is_error=lambda: unregister_error, to_string=lambda: "mock unregister error")
 
     backend = RForkTransferBackend()
-    backend.transfer_engine = SimpleNamespace(
-        batch_register_memory_ex=batch_register_memory_ex,
-        batch_unregister_memory=batch_unregister_memory,
+    engine_attrs = {"batch_unregister_memory": batch_unregister_memory}
+    if register_outcome != "unsupported":
+        engine_attrs["batch_register_memory_ex"] = batch_register_memory_ex
+    backend.transfer_engine = SimpleNamespace(**engine_attrs)
+    backend._memory_registration_cls = (
+        _MemoryRegistration if memory_registration_cls is _UNSET else memory_registration_cls
     )
-    backend._memory_registration_cls = _MemoryRegistration
     backend.registered_weight_blocks = list(stale_blocks)
     backend.registered_memory_addresses = [address for address, _ in stale_blocks]
     backend.weight_manifest = None
@@ -757,13 +750,13 @@ def _make_register_memory_region_backend(
     return backend, registrations, unregistered_calls
 
 
-def test_register_memory_region_skips_shared_weights(monkeypatch):
+def test_register_memory_region_registers_each_model_weight(monkeypatch):
     storage = torch.arange(100, dtype=torch.float32)
-    shared_weight = storage[:10]
-    own_weight = storage[20:32].reshape(2, 6)
+    embedding = storage[:10]
+    layer = storage[20:32].reshape(2, 6)
     backend, registrations, _ = _make_register_memory_region_backend(
         monkeypatch,
-        [("model.embed_tokens.weight", shared_weight), ("layers.0.fc.weight", own_weight)],
+        [("model.embed_tokens.weight", embedding), ("layers.0.fc.weight", layer)],
         [
             {
                 "address": storage.data_ptr(),
@@ -773,19 +766,15 @@ def test_register_memory_region_skips_shared_weights(monkeypatch):
         ],
     )
 
-    excluded_blocks = [(storage.data_ptr(), 40)]
-    assert backend.register_memory_region(object(), True, exclude_blocks=excluded_blocks)
-
-    assert set(backend.weight_manifest) == {"layers.0.fc.weight"}
-    assert [name for name, _ in backend._registered_transferable_tensors] == ["layers.0.fc.weight"]
-    assert backend.excluded_weight_blocks == excluded_blocks
+    assert backend.register_memory_region(object(), True)
+    assert set(backend.weight_manifest) == {"model.embed_tokens.weight", "layers.0.fc.weight"}
+    assert [name for name, _ in backend._registered_transferable_tensors] == [
+        "model.embed_tokens.weight",
+        "layers.0.fc.weight",
+    ]
     assert registrations == [
-        (
-            own_weight.data_ptr(),
-            own_weight.numel() * own_weight.element_size(),
-            storage.data_ptr() + 40,
-            360,
-        )
+        (weight.data_ptr(), weight.numel() * weight.element_size(), storage.data_ptr(), 400)
+        for weight in (embedding, layer)
     ]
 
 
@@ -810,29 +799,6 @@ def test_register_memory_region_splits_large_registration_batches(monkeypatch):
     assert backend.registered_memory_addresses == [weight.data_ptr() for weight in weights]
 
 
-def test_register_memory_region_skips_empty_batch_after_excluding_all_weights(monkeypatch):
-    storage = torch.arange(10, dtype=torch.float32)
-    backend, registrations, _ = _make_register_memory_region_backend(
-        monkeypatch,
-        [("model.embed_tokens.weight", storage)],
-        [
-            {
-                "address": storage.data_ptr(),
-                "size": storage.numel() * storage.element_size(),
-                "state": "active_allocated",
-            }
-        ],
-    )
-
-    excluded_blocks = [(storage.data_ptr(), storage.numel() * storage.element_size())]
-    assert backend.register_memory_region(object(), True, exclude_blocks=excluded_blocks)
-
-    assert backend.weight_manifest == {}
-    assert backend._registered_transferable_tensors == []
-    assert backend.registered_weight_blocks == []
-    assert registrations == []
-
-
 def _single_block_snapshot(storage):
     return [
         {
@@ -841,6 +807,39 @@ def _single_block_snapshot(storage):
             "state": "active_allocated",
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("register_outcome", "memory_registration_cls"),
+    [
+        ("unsupported", _UNSET),
+        ("ok", None),
+    ],
+    ids=["engine_without_batch_register_memory_ex", "engine_without_memory_registration"],
+)
+def test_register_memory_region_clears_state_when_engine_lacks_registration_support(
+    monkeypatch, register_outcome, memory_registration_cls
+):
+    storage = torch.arange(10, dtype=torch.float32)
+    backend, registrations, unregistered_calls = _make_register_memory_region_backend(
+        monkeypatch,
+        [("weight", storage)],
+        _single_block_snapshot(storage),
+        register_outcome=register_outcome,
+        memory_registration_cls=memory_registration_cls,
+    )
+
+    assert not backend.register_memory_region(object(), True)
+
+    # An engine that cannot register must leave no provisional manifest behind.
+    assert registrations == []
+    assert unregistered_calls == []
+    assert backend.weight_manifest is None
+    assert backend.weight_formats is None
+    assert backend.registered_weight_blocks == []
+    assert backend.registered_memory_addresses == []
+    assert backend._registered_transferable_tensors is None
+    assert backend._registered_transferable_storages is None
 
 
 @pytest.mark.parametrize("register_outcome", ["raise", "error", "none"])
@@ -885,6 +884,37 @@ def test_register_memory_region_retains_owners_when_rollback_also_fails(monkeypa
     assert [name for name, _ in backend._registered_transferable_tensors] == ["weight"]
 
 
+def test_register_memory_region_rolls_back_earlier_batches_when_a_later_batch_fails(monkeypatch):
+    storage = torch.arange(12, dtype=torch.uint8)
+    weights = [storage[0:2], storage[4:6]]
+    calls = []
+
+    backend, _, unregistered_calls = _make_register_memory_region_backend(
+        monkeypatch,
+        [(f"weight_{index}", weight) for index, weight in enumerate(weights)],
+        [{"address": storage.data_ptr(), "size": storage.numel(), "state": "active_allocated"}],
+    )
+    monkeypatch.setattr(transfer_backend, "MAX_MEMORY_REGISTRATION_BATCH_ITEMS", 1)
+
+    # Succeed on the first batch, fail on the second.
+    def batch_register_memory_ex(items):
+        calls.append([item.values for item in items])
+        if len(calls) == 1:
+            return SimpleNamespace(is_error=lambda: False)
+        return SimpleNamespace(is_error=lambda: True, to_string=lambda: "mock registration error")
+
+    backend.transfer_engine.batch_register_memory_ex = batch_register_memory_ex
+
+    assert not backend.register_memory_region(object(), False)
+
+    assert len(calls) == 2
+    # Roll back both batches using the same limit of one address per call.
+    assert unregistered_calls == [[weight.data_ptr()] for weight in weights]
+    assert backend.registered_memory_addresses == []
+    assert backend.weight_manifest is None
+    assert backend._registered_transferable_tensors is None
+
+
 def test_read_weights_from_seed_rejects_missing_registration_cache(monkeypatch):
     storage = torch.arange(100, dtype=torch.float32)
     own_weight = storage[20:32]
@@ -893,7 +923,6 @@ def test_read_weights_from_seed_rejects_missing_registration_cache(monkeypatch):
     backend.transfer_engine = SimpleNamespace(
         batch_transfer_sync_read=lambda *args: _append_and_return(reads, args, SimpleNamespace(is_error=lambda: False))
     )
-    backend.excluded_weight_blocks = [(storage.data_ptr(), 40)]
     backend._registered_transferable_tensors = None
 
     def fail_if_rescanned(*_args):
@@ -919,13 +948,12 @@ def test_read_weights_from_seed_rejects_missing_registration_cache(monkeypatch):
     assert reads == []
 
 
-def test_read_weights_from_seed_fails_for_unknown_weight_outside_shared_blocks(monkeypatch):
+def test_read_weights_from_seed_fails_for_missing_weight(monkeypatch):
     own_weight = torch.arange(12, dtype=torch.float32)
     backend = RForkTransferBackend()
     backend.transfer_engine = SimpleNamespace(
         batch_transfer_sync_read=lambda *args: SimpleNamespace(is_error=lambda: False)
     )
-    backend.excluded_weight_blocks = [(4096, 128)]
     backend._registered_transferable_tensors = [("layers.0.fc.weight", own_weight)]
 
     seed_info = SeedTransferInfo("seed-session", {}, formats={})
@@ -982,7 +1010,6 @@ def _format_read_backend(weight):
 
     backend = RForkTransferBackend()
     backend.transfer_engine = SimpleNamespace(batch_transfer_sync_read=read)
-    backend.excluded_weight_blocks = []
     backend._registered_transferable_tensors = [("layers.0.fc.weight", weight)]
     return backend, reads
 

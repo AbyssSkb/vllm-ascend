@@ -87,7 +87,6 @@ def update_registered_weight_info(info: dict[str, Any] | None, name: str, tensor
 def validate_weight_manifest(
     seed_info: SeedTransferInfo,
     transferable_tensors: list[tuple[str, torch.Tensor]],
-    skipped_shared_names: set[str],
 ) -> dict[str, tuple[int, int, int, tuple[int, ...], str]] | None:
     """Validate seed metadata against local tensors before any layout change or read."""
     remote_name_set = set(seed_info.weights)
@@ -97,35 +96,14 @@ def validate_weight_manifest(
         len(local_names) != len(local_name_set)
         or any(not isinstance(name, str) or not name for name in local_name_set)
         or any(not isinstance(name, str) or not name for name in remote_name_set)
-        or not isinstance(skipped_shared_names, set)
-        or any(not isinstance(name, str) or not name for name in skipped_shared_names)
     ):
-        logger.error("RFork manifest contains invalid local, remote, or skipped tensor names.")
+        logger.error("RFork manifest contains invalid local or remote tensor names.")
         return None
-    # Skipped names are remote weights backed by storage the receiver already shares with the
-    # target model, so they are filtered out of the local manifest by design and must only be
-    # validated against the remote manifest.  Requiring local membership would reject every
-    # partially shared draft model.
-    invalid_skips = skipped_shared_names - remote_name_set
-    if invalid_skips:
+    if local_name_set != remote_name_set:
         logger.error(
-            "RFork skipped_shared_names contains names not present in the remote manifest: %s",
-            sorted(invalid_skips, key=str),
-        )
-        return None
-    locally_present_skips = skipped_shared_names & local_name_set
-    if locally_present_skips:
-        logger.error(
-            "RFork skipped_shared_names contains names still present in the local manifest: %s",
-            sorted(locally_present_skips, key=str),
-        )
-        return None
-    if (local_name_set - skipped_shared_names) != (remote_name_set - skipped_shared_names):
-        logger.error(
-            "RFork manifest names differ after validated shared skips: local=%s remote=%s skipped=%s",
+            "RFork manifest names differ: local=%s remote=%s",
             sorted(local_name_set, key=str),
             sorted(remote_name_set, key=str),
-            sorted(skipped_shared_names, key=str),
         )
         return None
 
@@ -140,8 +118,6 @@ def validate_weight_manifest(
     parsed_remote: dict[str, tuple[int, int, int, tuple[int, ...], str]] = {}
     remote_total_bytes = 0
     for name, weight_info in seed_info.weights.items():
-        if name in skipped_shared_names:
-            continue
         parsed_weight_info = parse_weight_info(weight_info)
         if parsed_weight_info is None:
             logger.error("Invalid weight info for %s: %s", name, weight_info)
@@ -153,8 +129,6 @@ def validate_weight_manifest(
     local_total_bytes = 0
     local_by_name: dict[str, torch.Tensor] = {}
     for name, tensor in transferable_tensors:
-        if name in skipped_shared_names:
-            continue
         if (
             not isinstance(name, str)
             or not name

@@ -99,7 +99,7 @@ class RForkSession:
         self._lease_acquired_at: float | None = None
         self._registration_elapsed = 0.0
         self._source_transfer_session_id: str | None = None
-        self._deferred_seed_start: tuple[Any, bool, list[tuple[int, int]] | None] | None = None
+        self._deferred_seed_start: tuple[Any, bool] | None = None
         self._lock = threading.RLock()
         # Acquire before _lock; release responses must not wait on removal I/O.
         self._seed_lifecycle_lock = threading.RLock()
@@ -112,9 +112,7 @@ class RForkSession:
         self._atexit_callback = _atexit_shutdown
         atexit.register(self._atexit_callback)
 
-    def register_destination(
-        self, model, processed_layout: bool, exclude_blocks: list[tuple[int, int]] | None = None
-    ) -> bool:
+    def register_destination(self, model, processed_layout: bool) -> bool:
         """Prepare local buffers on the NPU caller thread before acquiring a lease."""
         with self._lock:
             if (
@@ -126,7 +124,7 @@ class RForkSession:
             self.state = RForkLifecycleState.CLEANUP_REQUIRED
             self._source_transfer_session_id = None
             started_at = time.monotonic()
-            if not self.transfer_backend.register_memory_region(model, processed_layout, exclude_blocks):
+            if not self.transfer_backend.register_memory_region(model, processed_layout):
                 return False
             self.planner.bind_structural_digest(_registered_structural_digest(self.transfer_backend))
             self._registration_elapsed = time.monotonic() - started_at
@@ -221,16 +219,6 @@ class RForkSession:
     def _stop_lease_renewal_locked(self) -> None:
         """Signal the lease renewal thread to stop without waiting under _lock."""
         self.lease_renew_stop_event.set()
-
-    def can_reuse_shared_weights(self, model, processed_layout: bool, exclude_blocks: list[tuple[int, int]]) -> bool:
-        with self._lock:
-            if (
-                self.state is not RForkLifecycleState.INITIALIZED
-                or self.seed_lease is not None
-                or self.lease_release_stop_event.is_set()
-            ):
-                return False
-            return self.transfer_backend.can_reuse_shared_weights(model, processed_layout, exclude_blocks)
 
     def transfer_from_seed(
         self,
@@ -429,10 +417,10 @@ class RForkSession:
                     or self.lease_release_stop_event.is_set()
                 ):
                     return
-                model, processed_layout, exclude_blocks = self._deferred_seed_start
+                model, processed_layout = self._deferred_seed_start
                 self._deferred_seed_start = None
             try:
-                promoted = self._start_seed_service(model, processed_layout, exclude_blocks)
+                promoted = self._start_seed_service(model, processed_layout)
             except Exception:
                 logger.exception(
                     "RFork deferred seed promotion raised after the source lease was released; "
@@ -494,7 +482,6 @@ class RForkSession:
         self,
         model,
         processed_layout: bool,
-        exclude_blocks: list[tuple[int, int]] | None = None,
         *,
         structural_digest: str | None = None,
     ) -> RForkSeedServiceStartResult:
@@ -519,20 +506,21 @@ class RForkSession:
                     if self.state is not RForkLifecycleState.TRANSFERRED or not processed_layout:
                         self.state = RForkLifecycleState.CLEANUP_REQUIRED
                         try:
-                            registered = self.transfer_backend.register_memory_region(
-                                model, processed_layout, exclude_blocks
-                            )
+                            registered = self.transfer_backend.register_memory_region(model, processed_layout)
                         except Exception:
                             logger.exception(
                                 "RFork seed memory registration raised; cleaning up before continuing inference."
                             )
                             registered = False
-                        # Preserve the lookup digest when checkpoint post-load processing reshapes weights.
+                        # Checkpoint post-load processing may reshape weights. Keep the
+                        # destination lookup identity while refreshing the serving manifest.
                         if registered and (processed_layout or self.planner.structural_digest is None):
                             try:
                                 structural_digest = _registered_structural_digest(self.transfer_backend)
                                 self.planner.bind_structural_digest(structural_digest)
                             except RuntimeError as exc:
+                                # Processed-layout registration and publication must describe
+                                # the same structure so future receivers use the same seed key.
                                 logger.error(
                                     "RFork refuses to advertise a seed whose structure changed "
                                     "after destination registration: %s. Inference can continue.",
@@ -546,16 +534,15 @@ class RForkSession:
                 if self.seed_lease is not None:
                     if self._lease_release_exhausted or self.lease_release_stop_event.is_set():
                         return RForkSeedServiceStartResult.FAILED
-                    self._deferred_seed_start = (model, processed_layout, exclude_blocks)
+                    # Deferred processed-layout promotion checks the live structure again.
+                    self._deferred_seed_start = (model, processed_layout)
                     self._ensure_lease_release_retry_locked()
                     logger.debug(
                         "RFork seed promotion is deferred until the source seed lease is released; "
                         "the transferred model remains available for inference."
                     )
                     return RForkSeedServiceStartResult.DEFERRED
-            started = self._start_seed_service(
-                model, processed_layout, exclude_blocks, structural_digest=structural_digest
-            )
+            started = self._start_seed_service(model, processed_layout, structural_digest=structural_digest)
             if not started:
                 self._cleanup_failed_seed_start()
             return RForkSeedServiceStartResult.STARTED if started else RForkSeedServiceStartResult.FAILED
@@ -564,7 +551,6 @@ class RForkSession:
         self,
         model,
         processed_layout: bool,
-        exclude_blocks: list[tuple[int, int]] | None = None,
         *,
         structural_digest: str | None = None,
     ) -> bool:
@@ -581,7 +567,8 @@ class RForkSession:
             self.state = RForkLifecycleState.CLEANUP_REQUIRED
         try:
             info = self._seed_transfer_info()
-            # Processed layouts must match the lookup digest; deferred promotion rescans the live model.
+            # Checkpoint publication retains the destination identity despite post-load reshapes.
+            # Processed layouts reuse the final scan immediately or rescan after deferred promotion.
             if processed_layout:
                 if structural_digest is None:
                     structural_digest = _compute_structural_digest(model, processed_layout)
