@@ -11,7 +11,7 @@ from typing import Any
 from vllm.logger import logger
 
 from vllm_ascend.model_loader.rfork.config import RForkConfig, RForkConfigurationError
-from vllm_ascend.model_loader.rfork.planner_client import RForkPlannerClient, lease_log_id
+from vllm_ascend.model_loader.rfork.planner_client import InvalidSeedLeaseError, RForkPlannerClient, lease_log_id
 from vllm_ascend.model_loader.rfork.seed_client import build_seed_url, fetch_seed_transfer_info
 from vllm_ascend.model_loader.rfork.seed_server import (
     RForkSeedServerHandle,
@@ -155,14 +155,17 @@ class RForkSession:
                 logger.error("RFork seed acquisition requires registered buffers; state=%s", self.state.name)
                 return False
             acquisition_started = time.monotonic()
-            self.seed_lease = self.planner.acquire_seed()
+            try:
+                self.seed_lease = self.planner.acquire_seed()
+            except InvalidSeedLeaseError as exc:
+                logger.warning("RFork rejected an invalid seed lease: %s", exc)
+                self.seed_lease = exc.lease
+                self._lease_acquired_at = acquisition_started
+                self._lease_release_attempts = 0
+                self._lease_release_exhausted = False
+                self._release_seed_locked()
+                return False
             if self.seed_lease is None:
-                self.seed_lease = self.planner.take_rejected_lease()
-                if self.seed_lease is not None:
-                    self._lease_acquired_at = acquisition_started
-                    self._lease_release_attempts = 0
-                    self._lease_release_exhausted = False
-                    self._release_seed_locked()
                 return False
             self._lease_acquired_at = acquisition_started
             self._lease_release_attempts = 0
