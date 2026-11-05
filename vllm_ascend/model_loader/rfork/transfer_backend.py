@@ -8,30 +8,21 @@ import math
 import threading
 import time
 from bisect import bisect_left, bisect_right
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from itertools import accumulate
 from typing import Any
+from uuid import uuid4
 
 import torch
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip, join_host_port
 
-from vllm_ascend.model_loader.rfork.manifest import (
-    is_positive_int,
-    normalize_dtype_name,
-    read_npu_format,
-    update_registered_weight_info,
-    validate_weight_manifest,
-)
 from vllm_ascend.model_loader.rfork.tensor_layout import (
-    TENSOR_LAYOUT_SAMPLE_LIMIT,
     build_structural_digest,
     collect_transferable_tensors,
     find_non_npu_state_tensors,
-    is_transferable_tensor,
     log_tensor_layout_summary,
-    reshape_tensor_to_seed_shape,
-    validate_transferable_tensor_layout,
+    read_npu_format,
 )
 from vllm_ascend.model_loader.rfork.timing import StageTimer
 from vllm_ascend.model_loader.rfork.types import SeedTransferInfo
@@ -41,7 +32,6 @@ MAX_TRANSFER_CHUNK_SEGMENTS = 512
 MAX_MEMORY_REGISTRATION_BATCH_ITEMS = 4096
 MAX_TRANSFER_ENGINE_FINALIZE_ATTEMPTS = 10
 TRANSFER_ENGINE_FINALIZE_RETRY_INTERVAL_SEC = 1.0
-TENSOR_LAYOUT_ERROR_EXCERPT_CHARS = 256
 MAX_TRANSFER_ENGINE_RPC_PORT = 65535
 
 
@@ -132,9 +122,8 @@ def _tensor_storage_owner(tensor: torch.Tensor) -> Any:
     raise RuntimeError("RFork could not retain the original storage owner for a registered tensor")
 
 
-def _validate_transferable_tensor_layouts(transferable_tensors: list[tuple[str, torch.Tensor]]) -> None:
-    for name, tensor in transferable_tensors:
-        validate_transferable_tensor_layout(name, tensor)
+def is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 class RForkTransferBackend:
@@ -152,19 +141,18 @@ class RForkTransferBackend:
         self.tp_rank = tp_rank
         self.transfer_engine: Any | None = None
         self.transfer_session_id: str | None = None
-        self.weight_manifest: dict[str, Any] | None = None
+        self.weight_manifest: dict[str, int] | None = None
         self.weight_formats: dict[str, int] | None = None
         self.registered_structural_digest: str | None = None
         self.registered_memory_addresses: list[int] = []
-        self._registered_transferable_tensors: list[tuple[str, torch.Tensor]] | None = None
+        self._registered_tensors: list[tuple[str, torch.Tensor]] | None = None
         self._registered_transferable_storages: list[Any] | None = None
         self._memory_registration_cls: Any | None = None
         self._not_ready_error_code: Any | None = None
         self._not_found_error_code: Any | None = None
         self._lifecycle_lock = threading.RLock()
-        self._is_initialized = False
 
-    def _initialize_transfer_engine(self) -> None:
+    def _initialize_transfer_engine(self, timing: StageTimer | None = None) -> None:
         try:
             from yr.datasystem import (  # type: ignore[import-not-found]
                 ErrorCode,
@@ -182,7 +170,13 @@ class RForkTransferBackend:
         # YuanRong's YR_TE_RPC_PORT_MIN/MAX range); the real port is read back below.
         endpoint = join_host_port(host, 0)
         device_name = f"npu:{torch.npu.current_device()}"
-        result = engine.initialize(endpoint, "ascend", device_name)
+        if timing is not None:
+            timing.mark("engine_initialize")
+        try:
+            result = engine.initialize(endpoint, "ascend", device_name)
+        finally:
+            if timing is not None:
+                timing.mark("engine_init_overhead")
         if result.is_error():
             raise RuntimeError(
                 f"YuanRong TransferEngine initialize({endpoint!r}, 'ascend', {device_name!r}) failed: "
@@ -204,12 +198,18 @@ class RForkTransferBackend:
             raise RuntimeError(
                 f"YuanRong TransferEngine returned an invalid RPC port {rpc_port!r} for endpoint {endpoint!r}."
             )
-        self.transfer_engine = engine
-        self.transfer_session_id = join_host_port(host, rpc_port)
+        try:
+            session_id = join_host_port(host, rpc_port)
+            not_ready_error_code = ErrorCode.kNotReady
+            not_found_error_code = getattr(ErrorCode, "kNotFound", None)
+        except Exception:
+            self._finalize_failed_initialization(engine)
+            raise
+        self.transfer_session_id = session_id
         self._memory_registration_cls = MemoryRegistration
-        self._not_ready_error_code = ErrorCode.kNotReady
-        self._not_found_error_code = getattr(ErrorCode, "kNotFound", None)
-        self._is_initialized = True
+        self._not_ready_error_code = not_ready_error_code
+        self._not_found_error_code = not_found_error_code
+        self.transfer_engine = engine
 
     @staticmethod
     def _finalize_failed_initialization(engine: Any) -> None:
@@ -226,71 +226,67 @@ class RForkTransferBackend:
         self.weight_formats = None
         self.registered_structural_digest = None
         self.registered_memory_addresses = []
-        self._registered_transferable_tensors = None
+        self._registered_tensors = None
         self._registered_transferable_storages = None
 
-    def log_model_layout_summary(
-        self,
-        model,
-        processed_layout: bool,
-        *,
-        stage: str,
-        peer_session_id: str | None = None,
-    ) -> str | None:
-        """Observe a live model layout without changing transfer acceptance."""
-        try:
-            with self._lifecycle_lock:
-                tensors = list(collect_transferable_tensors(model, processed_layout))
-                # Read each NPU format once and share it with the digest and the log summary.
-                formats = {name: fmt for name, tensor in tensors if (fmt := read_npu_format(tensor)) is not None}
-                structural_digest = build_structural_digest(tensors, known_formats=formats)
+    def validate_final_layout(self, model, *, peer_session_id: str | None = None) -> None:
+        """Verify the final layout against the full inventory captured at registration."""
+        with self._lifecycle_lock:
+            tensors = collect_transferable_tensors(model)
+            formats = {}
+            for name, tensor in tensors:
+                fmt = read_npu_format(tensor)
+                if fmt is None:
+                    raise RuntimeError(f"RFork could not read the final NPU storage format for {name}")
+                formats[name] = fmt
+            digest = build_structural_digest(tensors, known_formats=formats)
+            if not self.registered_structural_digest or digest != self.registered_structural_digest:
+                raise RuntimeError("RFork final tensor structure differs from registration")
+            try:
                 log_tensor_layout_summary(
                     tensors,
-                    stage=stage,
+                    stage="receiver_after_transfer_finalize",
                     session_id=self.transfer_session_id,
                     peer_session_id=peer_session_id,
-                    processed_layout=processed_layout,
                     known_formats=formats,
                 )
-                return structural_digest
-        except Exception as exc:
-            # Diagnostics must not turn an otherwise usable transferred model into a fallback.
-            error_excerpt = " ".join(str(exc).split())[:TENSOR_LAYOUT_ERROR_EXCERPT_CHARS]
-            logger.info(
-                "RFork tensor layout summary: stage=%s session=%s peer_session=%s layout=%s unavailable=%s:%s",
-                stage,
-                self.transfer_session_id,
-                peer_session_id,
-                "processed" if processed_layout else "checkpoint",
-                type(exc).__name__,
-                error_excerpt,
-            )
-            return None
+            except Exception:
+                logger.exception("RFork could not log the final tensor layout summary.")
 
     def register_memory_region(
         self,
         model,
-        processed_layout: bool,
+        *,
+        purpose: str = "unknown",
+        identity=None,
     ) -> bool:
         timing = StageTimer("lock_wait")
         outcome = "exception"
+        session_id = None
         try:
             with self._lifecycle_lock:
                 try:
-                    timing.mark("engine_init")
+                    timing.mark("engine_init_overhead")
                     if self.transfer_engine is None:
-                        self._initialize_transfer_engine()
+                        self._initialize_transfer_engine(timing)
                     timing.mark("device_check")
-                    registered = self._register_memory_region_locked(model, processed_layout, timing)
+                    registered = self._register_memory_region_locked(model, timing)
                     outcome = "success" if registered else "failed"
                     return registered
                 finally:
+                    session_id = self.transfer_session_id
                     timing.mark("lock_release")
         finally:
             total_s, stages_s = timing.finish()
             logger.info(
-                "RFork registration timing: scope=register_memory_region relation=nested "
-                "outcome=%s total_s=%.6f stages_s=%s",
+                "RFork registration timing: scope=register_memory_region relation=nested registration_id=%s "
+                "purpose=%s model_kind=%s global_rank=%s tp_rank=%s session=%s outcome=%s total_s=%.6f stages_s=%s",
+                uuid4().hex,
+                purpose,
+                "unknown" if identity is None else ("draft" if identity.is_draft_model else "main"),
+                getattr(identity, "global_rank", "unknown"),
+                self.tp_rank,
+                session_id,
                 outcome,
                 total_s,
                 stages_s,
@@ -299,7 +295,6 @@ class RForkTransferBackend:
     def _register_memory_region_locked(
         self,
         model,
-        processed_layout: bool,
         timing: StageTimer,
     ) -> bool:
         transfer_engine = self._engine()
@@ -324,28 +319,17 @@ class RForkTransferBackend:
             )
 
         timing.mark("collect")
-        transferable_tensors = list(collect_transferable_tensors(model, processed_layout))
-        _validate_transferable_tensor_layouts(transferable_tensors)
+        transferable_tensors = collect_transferable_tensors(model)
         if not transferable_tensors:
             logger.error("RFork refuses to register an empty transferable tensor manifest.")
             return False
 
-        transferable_names = [name for name, _ in transferable_tensors]
-        if any(not isinstance(name, str) or not name for name in transferable_names) or len(transferable_names) != len(
-            set(transferable_names)
-        ):
-            logger.error("RFork refuses a manifest with duplicate or empty tensor names.")
-            return False
-
         timing.mark("manifest")
-        weight_mr_dict: dict[str, Any] = {}
+        weight_mr_dict: dict[str, int] = {}
         weight_format_dict: dict[str, int] = {}
         tensor_ranges: list[tuple[int, int]] = []
         transferable_storages: list[Any] = []
         for name, weight in transferable_tensors:
-            if not is_transferable_tensor(weight):
-                logger.error("RFork found an invalid transferable tensor entry: %r", name)
-                return False
             transferable_storages.append(_tensor_storage_owner(weight))
             weight_ptr = weight.data_ptr()
             weight_numel = weight.numel()
@@ -353,14 +337,7 @@ class RForkTransferBackend:
             if not all(is_positive_int(value) for value in (weight_ptr, weight_numel, weight_size)):
                 logger.error("RFork found an invalid tensor manifest entry for %s", name)
                 return False
-            weight_shape = tuple(weight.shape)
-            weight_mr_dict[name] = (
-                weight_ptr,
-                weight_numel,
-                weight_size,
-                weight_shape,
-                normalize_dtype_name(weight.dtype),
-            )
+            weight_mr_dict[name] = weight_ptr
             weight_format = read_npu_format(weight)
             if weight_format is None:
                 logger.error("RFork could not read the NPU storage format for %s", name)
@@ -457,7 +434,7 @@ class RForkTransferBackend:
 
         self.weight_manifest = weight_mr_dict
         self.weight_formats = weight_format_dict
-        self._registered_transferable_tensors = transferable_tensors
+        self._registered_tensors = transferable_tensors
         self.registered_structural_digest = structural_digest
         logger.debug(
             "register_memory_region time: %.4fs, weights: %d",
@@ -469,7 +446,6 @@ class RForkTransferBackend:
             transferable_tensors,
             stage="registration",
             session_id=self.transfer_session_id,
-            processed_layout=processed_layout,
             known_formats=weight_format_dict,
         )
         return True
@@ -561,7 +537,7 @@ class RForkTransferBackend:
             raise ValueError("RFork TransferEngine finalize retry_interval_sec must be a non-negative number")
 
         with self._lifecycle_lock:
-            if not self._is_initialized:
+            if self.transfer_engine is None:
                 return True
             transfer_engine = self._engine()
             for attempt in range(1, max_attempts + 1):
@@ -579,7 +555,6 @@ class RForkTransferBackend:
                     self._clear_registration_state()
                     self.transfer_session_id = None
                     self.transfer_engine = None
-                    self._is_initialized = False
                     return True
 
                 logger.warning(
@@ -601,83 +576,19 @@ class RForkTransferBackend:
 
     def read_weights_from_seed(
         self,
-        model,
         seed_info: SeedTransferInfo,
-        processed_layout: bool,
     ) -> bool:
         with self._lifecycle_lock:
-            return self._read_weights_from_seed_locked(model, seed_info, processed_layout)
+            return self._read_weights_from_seed_locked(seed_info)
 
     def _read_weights_from_seed_locked(
         self,
-        model,
         seed_info: SeedTransferInfo,
-        processed_layout: bool,
     ) -> bool:
-        if (
-            not isinstance(seed_info.session_id, str)
-            or not seed_info.session_id
-            or not isinstance(seed_info.weights, Mapping)
-        ):
-            logger.error("RFork seed returned an invalid session or weight manifest.")
-            return False
-
-        transferable_tensors = self._registered_transferable_tensors
+        transferable_tensors = self._registered_tensors
         if transferable_tensors is None:
-            logger.error("RFork cannot read seed weights without a successful destination registration.")
+            logger.error("RFork cannot read seed weights without a destination tensor inventory.")
             return False
-        _validate_transferable_tensor_layouts(transferable_tensors)
-        if not transferable_tensors:
-            logger.error("RFork refuses to transfer an empty local tensor manifest.")
-            return False
-
-        local_names = [name for name, _ in transferable_tensors]
-        local_name_set = set(local_names)
-        if (
-            len(local_names) != len(local_name_set)
-            or not local_name_set
-            or any(not isinstance(name, str) or not name for name in local_name_set)
-        ):
-            logger.error("RFork local tensor manifest has duplicate or empty names.")
-            return False
-
-        remote_names = list(seed_info.weights)
-        remote_name_set = set(remote_names)
-        if (
-            len(remote_names) != len(remote_name_set)
-            or not remote_name_set
-            or any(not isinstance(name, str) or not name for name in remote_name_set)
-        ):
-            logger.error("RFork remote tensor manifest has duplicate or empty names.")
-            return False
-
-        parsed_remote = validate_weight_manifest(seed_info, transferable_tensors)
-        if parsed_remote is None:
-            return False
-
-        reshape_events: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
-        for name, tensor in transferable_tensors:
-            if not reshape_tensor_to_seed_shape(name, tensor, parsed_remote[name][3], reshape_events):
-                return False
-            update_registered_weight_info(
-                self.weight_manifest,
-                name,
-                tensor,
-            )
-
-        if reshape_events:
-            # Reshaping to the seed layout is a designed compatibility path; log it once.
-            log_reshape = logger.info if self.tp_rank == 0 else logger.debug
-            log_reshape(
-                "RFork reshaped %d tensor(s) to the seed layout, e.g. %s",
-                len(reshape_events),
-                ", ".join(
-                    f"{name} {local}->{seed}" for name, local, seed in reshape_events[:TENSOR_LAYOUT_SAMPLE_LIMIT]
-                ),
-            )
-
-        # Revalidate cached tensors immediately before constructing raw byte reads.
-        _validate_transferable_tensor_layouts(transferable_tensors)
 
         weight_names: list[str] = []
         seed_ptr_list: list[int] = []
@@ -685,8 +596,12 @@ class RForkTransferBackend:
         client_len_list: list[int] = []
         # Keep reads per name; address-only merging is unsafe when remote/local offsets differ.
         for name, tensor in transferable_tensors:
+            seed_ptr = seed_info.weights.get(name)
+            if not is_positive_int(seed_ptr):
+                logger.error("RFork seed returned a missing or invalid address for %s", name)
+                return False
             weight_names.append(name)
-            seed_ptr_list.append(parsed_remote[name][0])
+            seed_ptr_list.append(seed_ptr)
             client_ptr_list.append(tensor.data_ptr())
             client_len_list.append(tensor.numel() * tensor.element_size())
 
@@ -695,7 +610,6 @@ class RForkTransferBackend:
             stage="receiver_before_read",
             session_id=self.transfer_session_id,
             peer_session_id=seed_info.session_id,
-            processed_layout=processed_layout,
             known_formats=self.weight_formats,
         )
 

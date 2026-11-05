@@ -11,6 +11,8 @@ from unittest.mock import Mock
 import pytest
 import requests
 
+from tests.ut.model_loader.rfork.session_test_utils import wait_for_lease_release
+
 _MISSING = object()
 
 
@@ -226,16 +228,9 @@ def _make_legacy_session(runtime, monkeypatch, planner, *, identity=None):
     backend.finalize_transfer_engine.return_value = True
     backend.weight_formats = {}
     session.transfer_backend = backend
-    assert session.register_destination(object(), True)
+    assert session.register_receiver_weights(object())
     planner.publish(session.planner.seed_key)
     return session, backend
-
-
-def _wait_for_release(session) -> None:
-    worker = session.lease_release_thread
-    if worker is not None:
-        worker.join(2)
-    assert session.lease_release_thread is None or not session.lease_release_thread.is_alive()
 
 
 @pytest.mark.parametrize("is_draft_model", [False, True])
@@ -267,15 +262,19 @@ def test_legacy_session_acquire_does_not_start_lease_renewal(runtime, monkeypatc
     planner = _LegacyPlannerAdapter()
     session, _ = _make_legacy_session(runtime, monkeypatch, planner)
 
-    assert session.acquire_seed()
+    with monkeypatch.context() as context:
+        threads = Mock(wraps=runtime.session.threading.Thread)
+        context.setattr(runtime.session.threading, "Thread", threads)
+        assert session.acquire_seed_lease()
+        threads.assert_not_called()
     assert session.seed_lease is not None
     assert session.seed_lease.lease_ttl_sec is None
-    assert session.lease_renew_thread is None
     assert not any(path == "/renew_seed_lease" for _, path in planner.calls)
 
     session.prepare_for_fallback()
-    _wait_for_release(session)
+    wait_for_lease_release(session)
     assert planner.active_count == 0
+    assert session.shutdown()
 
 
 @pytest.mark.parametrize("invalid_ttl", ["", 0, -1, "nan", "inf", "invalid"])
@@ -292,28 +291,19 @@ def test_invalid_ttl_returns_allocation_for_cleanup(runtime, monkeypatch, invali
 
 
 def test_invalid_lease_is_released_in_background_with_retries(runtime, monkeypatch):
-    entered, resume = Event(), Event()
     planner = _LegacyPlannerAdapter(
         lease_ttl_header="invalid",
         put_statuses=[503, 200],
-        put_entered=entered,
-        put_gate=resume,
-        block_put_on_call=1,
     )
     session, backend = _make_legacy_session(runtime, monkeypatch, planner)
-    try:
-        assert not session.acquire_seed()
-        assert entered.wait(2)
-        assert session.seed_lease is not None
-        assert not session.acquire_seed()
-        assert [path for _, path in planner.calls].count("/get_seed") == 1
-        backend.read_weights_from_seed.assert_not_called()
-    finally:
-        resume.set()
-    _wait_for_release(session)
+
+    assert not session.acquire_seed_lease()
+    wait_for_lease_release(session)
     assert planner.put_attempt_count == 2
     assert planner.active_count == 0
-    assert session.seed_lease is None
+    assert [path for _, path in planner.calls].count("/get_seed") == 1
+    backend.read_weights_from_seed.assert_not_called()
+    assert session.prepare_for_fallback()
     assert session.shutdown()
 
 

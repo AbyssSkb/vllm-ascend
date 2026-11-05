@@ -86,21 +86,6 @@ class RForkPlannerClient:
     def structural_digest(self) -> str | None:
         return self._structural_digest
 
-    def verify_structural_digest(self, digest: str) -> bool:
-        """Bind on first use; log when the live structure drifted from registration."""
-        if self._structural_digest is None:
-            self.bind_structural_digest(digest)
-            return True
-        if self._structural_digest != digest:
-            logger.error(
-                "RFork structural digest changed between registration and seed advertisement: "
-                "bound=%s current=%s; retaining the registered digest.",
-                self._structural_digest,
-                digest,
-            )
-            return False
-        return True
-
     @property
     def seed_key(self) -> str:
         if self._seed_key is None:

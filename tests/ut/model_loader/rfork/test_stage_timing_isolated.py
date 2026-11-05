@@ -47,16 +47,18 @@ def test_registration_timing_covers_inventory_native_calls_and_rollback(tensor_r
     )
     backend._memory_registration_cls = lambda *fields: fields
     backend.transfer_session_id = "registered-session"
+    identity = SimpleNamespace(global_rank=5, is_draft_model=True)
 
     with caplog.at_level(logging.INFO, logger=transfer.logger.name):
-        assert backend.register_memory_region(model, True) is not fail
+        assert backend.register_memory_region(model, purpose="destination", identity=identity) is not fail
 
     message, stages = _record(caplog)
     assert "relation=nested" in message
+    assert "purpose=destination model_kind=draft global_rank=5 tp_rank=1 session=registered-session" in message
     assert f"outcome={'failed' if fail else 'success'}" in message
     assert {
         "lock_wait",
-        "engine_init",
+        "engine_init_overhead",
         "device_check",
         "collect",
         "manifest",
@@ -75,7 +77,23 @@ def test_registration_timing_records_exception(tensor_runtime, monkeypatch, capl
     backend = tensor_runtime.RForkTransferBackend()
     monkeypatch.setattr(backend, "_initialize_transfer_engine", lambda *_: (_ for _ in ()).throw(RuntimeError("init")))
     with caplog.at_level(logging.INFO, logger=transfer.logger.name), pytest.raises(RuntimeError, match="init"):
-        backend.register_memory_region(object(), False)
+        backend.register_memory_region(object())
     message, stages = _record(caplog)
     assert "outcome=exception" in message
-    assert "engine_init" in stages
+    assert "engine_init_overhead" in stages
+
+
+@pytest.mark.parametrize("purpose", ["destination", "seed_service"])
+def test_session_labels_registration_purpose(runtime, purpose):
+    session = runtime.session.RForkSession(runtime.config, runtime.identity)
+    session.transfer_backend.register_memory_region.return_value = False
+    model = object()
+
+    if purpose == "destination":
+        assert not session.register_receiver_weights(model)
+    else:
+        session.register_local_weights_for_seed(model)
+
+    session.transfer_backend.register_memory_region.assert_called_once_with(
+        model, purpose=purpose, identity=runtime.identity
+    )

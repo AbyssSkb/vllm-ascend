@@ -7,6 +7,7 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -72,9 +73,8 @@ def mtp_model(rfork_helpers, tensor_runtime, monkeypatch):
         (None, False),
     ],
 )
-@pytest.mark.parametrize("processed_layout", [False, True])
 def test_mtp_checkpoint_preparation_preserves_registered_structure(
-    rfork_helpers, tensor_runtime, mtp_model, monkeypatch, head_name, has_own_head, processed_layout
+    rfork_helpers, tensor_runtime, mtp_model, monkeypatch, head_name, has_own_head
 ):
     model = mtp_model.model
     layout = tensor_runtime.tensor_layout
@@ -82,14 +82,14 @@ def test_mtp_checkpoint_preparation_preserves_registered_structure(
     original = head.weight.detach().clone()
     assert not hasattr(model, "lm_head")
     names = {head_name} if head_name is not None else set()
-    unprepared_digest = layout.build_structural_digest(layout.collect_transferable_tensors(model, processed_layout))
+    unprepared_digest = layout.build_structural_digest(layout.collect_transferable_tensors(model))
 
     monkeypatch.setattr(rfork_helpers.loader, "_get_checkpoint_weight_names", lambda *args: names)
     rfork_helpers.loader._prepare_rfork_model_state(model, SimpleNamespace(), SimpleNamespace())
-    before = layout.collect_transferable_tensors(model, processed_layout)
+    before = layout.collect_transferable_tensors(model)
     digest = layout.build_structural_digest(before)
     loaded = model.load_weights((name, original) for name in names)
-    after = layout.collect_transferable_tensors(model, processed_layout)
+    after = layout.collect_transferable_tensors(model)
 
     assert loaded == names
     assert model.has_own_lm_head is has_own_head
@@ -355,12 +355,12 @@ def test_checkpoint_names_reject_unavailable_metadata(
         )
 
 
-@pytest.mark.parametrize("processed_layout", [False, True])
+@pytest.mark.parametrize("quantization", [None, "ascend"])
 @pytest.mark.parametrize(
     "outcome", ["transfer", "local", "transfer_error", "metadata_error", "state_error", "other_model"]
 )
 def test_model_state_preparation_precedes_registration_and_guards_fallback(
-    rfork_helpers, monkeypatch, processed_layout, outcome
+    rfork_helpers, monkeypatch, outcome, quantization
 ):
     module = rfork_helpers.loader
     # Pytest's log capture would retain fallback exceptions and their model-owning tracebacks.
@@ -421,21 +421,21 @@ def test_model_state_preparation_precedes_registration_and_guards_fallback(
         return result
 
     session = SimpleNamespace(
-        register_destination=lambda *args: record("register", True),
-        acquire_seed=lambda: record("acquire", outcome != "local"),
-        transfer_from_seed=lambda *args: record("transfer", outcome != "transfer_error"),
-        log_transferred_model_layout=lambda *args: record("digest", "prepared-digest"),
-        prepare_for_fallback=lambda: record("cleanup", SimpleNamespace(can_schedule_seed=True)),
+        loading=nullcontext,
+        register_receiver_weights=lambda *args: record("register", True),
+        acquire_seed_lease=lambda: record("acquire", outcome != "local"),
+        read_weights_from_seed=lambda *args: record("transfer", outcome != "transfer_error"),
+        validate_transferred_model_layout=lambda *args: record("digest", "prepared-digest"),
+        prepare_for_fallback=lambda: record("cleanup", True),
     )
     loader = module.RForkModelLoader.__new__(module.RForkModelLoader)
     loader.load_config = SimpleNamespace(device=None)
-    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda *args: session)
-    monkeypatch.setattr(loader, "_requires_processed_layout_transfer", lambda *args: processed_layout)
+    monkeypatch.setattr(loader, "_get_session", lambda *args: session)
     monkeypatch.setattr(module, "_get_checkpoint_weight_names", metadata)
     monkeypatch.setattr(module, "initialize_model", initialize)
     monkeypatch.setattr(module, "process_weights_after_loading", lambda *args: record("process"))
-    monkeypatch.setattr(module, "_rfork_skip_unquantized_moe_post_load_processing", lambda *args: nullcontext())
-    monkeypatch.setattr(module, "_start_rfork_seed_service", lambda *args, **kwargs: record("seed", True))
+    monkeypatch.setattr(module, "_validate_rfork_shared_experts", lambda *args: record("validate"))
+    monkeypatch.setattr(module, "_schedule_seed_publication", lambda *args, **kwargs: record("seed", True))
     monkeypatch.setattr(module, "_load_with_default_loader", default_load)
     monkeypatch.setattr(
         torch, "npu", SimpleNamespace(synchronize=lambda: None, empty_cache=lambda: None), raising=False
@@ -445,7 +445,7 @@ def test_model_state_preparation_precedes_registration_and_guards_fallback(
         "get_ascend_config",
         lambda: SimpleNamespace(eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None)),
     )
-    model_config = SimpleNamespace(dtype=torch.float32)
+    model_config = SimpleNamespace(dtype=torch.float32, quantization=quantization)
     vllm_config = SimpleNamespace(device_config=SimpleNamespace(device="cpu"), model_config=model_config)
 
     result = loader.load_model(vllm_config, model_config)
@@ -458,9 +458,26 @@ def test_model_state_preparation_precedes_registration_and_guards_fallback(
         assert events == prefix + ["cleanup", "default"]
     else:
         assert result is (fallback_model if outcome in ("local", "transfer_error") else model_ref())
-        expected = prefix + (["process"] if processed_layout else []) + ["register", "acquire"]
+        expected = prefix + ["process", "register", "acquire"]
         if outcome in ("local", "transfer_error"):
             expected += ([] if outcome == "local" else ["transfer"]) + ["cleanup", "default", "seed"]
         else:
-            expected += ["transfer"] + ([] if processed_layout else ["process"]) + ["digest", "seed"]
+            expected += ["transfer", "validate", "digest", "seed"]
         assert events == expected
+
+
+def test_shared_expert_validation_runs_only_when_overlap_enabled(rfork_helpers):
+    enabled = Mock()
+    enabled.multistream_overlap = True
+    disabled = Mock()
+    disabled.multistream_overlap = False
+    model = Module()
+    model.enabled = rfork_helpers.AscendMoERunner()
+    model.enabled.ascend_shared_experts = enabled
+    model.disabled = rfork_helpers.AscendMoERunner()
+    model.disabled.ascend_shared_experts = disabled
+
+    rfork_helpers.loader._validate_rfork_shared_experts(model)
+
+    enabled.validate_consistency.assert_called_once_with()
+    disabled.validate_consistency.assert_not_called()
