@@ -961,7 +961,6 @@ def test_manifest_rejects_duplicate_or_divergent_tensor_names(manifest_module):
         manifest_module.validate_weight_manifest(
             seed_info,
             [("weight", tensor), ("weight", tensor)],
-            set(),
         )
         is None
     )
@@ -969,71 +968,18 @@ def test_manifest_rejects_duplicate_or_divergent_tensor_names(manifest_module):
         manifest_module.validate_weight_manifest(
             seed_info,
             [("different.weight", tensor)],
-            set(),
         )
         is None
     )
 
 
-def test_manifest_allows_a_validated_remote_only_shared_skip(manifest_module, monkeypatch):
+def test_manifest_rejects_remote_only_weight(manifest_module):
     tensor = torch.ones(1, dtype=torch.float32)
     seed_info = SimpleNamespace(
-        weights={
-            "weight": (1, 1, 4, [1], "float32"),
-            "shared.weight": (2, 1, 4, [1], "float32"),
-        },
-        formats={"weight": 0, "shared.weight": 0},
+        weights={"weight": (1, 1, 4, [1], "float32"), "extra.weight": (2, 1, 4, [1], "float32")},
+        formats={"weight": 0, "extra.weight": 0},
     )
-    monkeypatch.setattr(manifest_module, "read_npu_format", lambda _tensor: 0)
-
-    parsed = manifest_module.validate_weight_manifest(
-        seed_info,
-        [("weight", tensor)],
-        {"shared.weight"},
-    )
-
-    assert parsed == {"weight": (1, 1, 4, (1,), "float32")}
-
-
-def test_manifest_rejects_a_skip_missing_from_the_remote_manifest(manifest_module, monkeypatch):
-    tensor = torch.ones(1, dtype=torch.float32)
-    seed_info = SimpleNamespace(
-        weights={"weight": (1, 1, 4, [1], "float32")},
-        formats={"weight": 0},
-    )
-    monkeypatch.setattr(manifest_module, "read_npu_format", lambda _tensor: 0)
-
-    assert (
-        manifest_module.validate_weight_manifest(
-            seed_info,
-            [("weight", tensor)],
-            {"absent.weight"},
-        )
-        is None
-    )
-
-
-def test_manifest_rejects_a_skip_still_present_locally(manifest_module, monkeypatch):
-    tensor = torch.ones(1, dtype=torch.float32)
-    seed_info = SimpleNamespace(
-        weights={
-            "weight": (1, 1, 4, [1], "float32"),
-            "shared.weight": (2, 1, 4, [1], "float32"),
-        },
-        formats={"weight": 0, "shared.weight": 0},
-    )
-    monkeypatch.setattr(manifest_module, "read_npu_format", lambda _tensor: 0)
-
-    # A skipped name that the caller left in the local manifest means the exclusion
-    # filter diverged from the skip set, so the transfer must not proceed.
-    assert (
-        manifest_module.validate_weight_manifest(
-            seed_info,
-            [("weight", tensor), ("shared.weight", tensor)],
-            {"shared.weight"},
-        )
-        is None
-    )
+    assert manifest_module.validate_weight_manifest(seed_info, [("weight", tensor)]) is None
 
 
 def test_seed_url_appends_independent_port_and_rejects_conflicts(seed_module):

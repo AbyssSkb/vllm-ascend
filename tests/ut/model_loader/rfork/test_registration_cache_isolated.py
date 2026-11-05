@@ -263,9 +263,8 @@ def test_post_load_layout_diagnostic_failure_does_not_escape(tensor_runtime, mon
 
 
 @pytest.mark.parametrize("processed_layout", [False, True])
-@pytest.mark.parametrize("exclude_shared", [False, True])
 @pytest.mark.parametrize("deferred", [False, True])
-def test_session_reuses_inventory_and_final_digest(runtime, monkeypatch, processed_layout, exclude_shared, deferred):
+def test_session_reuses_inventory_and_final_digest(runtime, monkeypatch, processed_layout, deferred):
     prefix = "vllm_ascend.model_loader.rfork"
     layout = sys.modules[f"{prefix}.tensor_layout"]
     transfer = _load_module(monkeypatch, f"{prefix}.transfer_backend", "transfer_backend.py")
@@ -279,7 +278,6 @@ def test_session_reuses_inventory_and_final_digest(runtime, monkeypatch, process
     model.register_buffer("scale", torch.tensor(1.0))
     inventory = layout.collect_transferable_tensors(model, processed_layout)
     expected_digest = layout.build_structural_digest(inventory)
-    excluded = [(model.scale.data_ptr(), model.scale.element_size())] if exclude_shared else None
     success = SimpleNamespace(is_error=lambda: False)
     blocks = [
         {"address": tensor.data_ptr(), "size": tensor.numel() * tensor.element_size(), "state": "active_allocated"}
@@ -314,10 +312,10 @@ def test_session_reuses_inventory_and_final_digest(runtime, monkeypatch, process
     monkeypatch.setattr(session.planner, "verify_structural_digest", verify)
 
     try:
-        assert session.register_destination(model, processed_layout, excluded)
+        assert session.register_destination(model, processed_layout)
         assert collect.call_count == 1
         assert session.planner.structural_digest == expected_digest
-        assert len(backend._registered_transferable_tensors) == (1 if exclude_shared else 2)
+        assert len(backend._registered_transferable_tensors) == 2
         seed_info = runtime.types.SeedTransferInfo(
             "seed-session", dict(backend.weight_manifest), formats=dict(backend.weight_formats)
         )
@@ -332,7 +330,7 @@ def test_session_reuses_inventory_and_final_digest(runtime, monkeypatch, process
         digest = session.log_transferred_model_layout(model, processed_layout)
         assert digest == expected_digest
         assert collect.call_count == 2
-        result = session.start_seed_service(model, processed_layout, excluded, structural_digest=digest)
+        result = session.start_seed_service(model, processed_layout, structural_digest=digest)
         # Checkpoint-layout promotion needs a new registration after post-load processing.
         expected_scans = 2 + (not processed_layout)
         assert collect.call_count == expected_scans
@@ -379,8 +377,8 @@ def test_bfs_preserves_device_empty_meta_and_layout_checks(tensor_runtime, monke
         layout.collect_transferable_tensors(model, True)
 
 
-@pytest.mark.parametrize("exclude_shared, matching_aliases", [(False, True), (True, True), (False, False)])
-def test_bfs_ids_match_seed_reads_and_shared_exclusions(tensor_runtime, monkeypatch, exclude_shared, matching_aliases):
+@pytest.mark.parametrize("matching_aliases", [True, False])
+def test_bfs_ids_match_seed_reads(tensor_runtime, monkeypatch, matching_aliases):
     def make_model(shared_value, own_value, reverse, matching_aliases=True):
         model = torch.nn.Module()
         shared = torch.full((4,), shared_value, dtype=torch.float32)
@@ -390,7 +388,6 @@ def test_bfs_ids_match_seed_reads_and_shared_exclusions(tensor_runtime, monkeypa
         return model
 
     layout = tensor_runtime.tensor_layout
-    transfer = tensor_runtime.transfer_backend
     manifest = sys.modules["vllm_ascend.model_loader.rfork.manifest"]
     monkeypatch.setattr(layout, "is_transferable_tensor", lambda _tensor: True)
     monkeypatch.setattr(manifest, "read_npu_format", lambda _tensor: 0)
@@ -401,8 +398,6 @@ def test_bfs_ids_match_seed_reads_and_shared_exclusions(tensor_runtime, monkeypa
     assert (
         layout.build_structural_digest(source_tensors) == layout.build_structural_digest(destination_tensors)
     ) == matching_aliases
-    shared = destination.impl["a"]
-    excluded = [(shared.data_ptr(), shared.numel() * shared.element_size())] if exclude_shared else []
     reads = []
 
     def read(_session, client_ptrs, seed_ptrs, lengths):
@@ -413,10 +408,7 @@ def test_bfs_ids_match_seed_reads_and_shared_exclusions(tensor_runtime, monkeypa
 
     backend = tensor_runtime.RForkTransferBackend()
     backend.transfer_engine = SimpleNamespace(batch_transfer_sync_read=read)
-    backend._registered_transferable_tensors, _ = transfer._split_tensors_by_excluded_blocks(
-        destination_tensors, excluded
-    )
-    backend.excluded_weight_blocks = excluded
+    backend._registered_transferable_tensors = destination_tensors
     seed_info = tensor_runtime.SeedTransferInfo(
         "seed-session",
         {
@@ -432,9 +424,9 @@ def test_bfs_ids_match_seed_reads_and_shared_exclusions(tensor_runtime, monkeypa
         assert reads == []
         return
     assert success
-    assert len(reads) == (1 if exclude_shared else 2)
+    assert len(reads) == 2
     assert destination.impl["a"] is destination.impl["b"]
-    torch.testing.assert_close(destination.impl["a"], torch.full((4,), 11.0 if exclude_shared else 7.0))
+    torch.testing.assert_close(destination.impl["a"], torch.full((4,), 7.0))
     torch.testing.assert_close(destination.impl["own"], torch.full((3,), 5.0))
 
 
@@ -499,8 +491,7 @@ def test_layout_error_names_the_full_tensor_path(tensor_runtime, monkeypatch):
         layout.collect_transferable_tensors(model, True)
 
 
-@pytest.mark.parametrize("exclude_shared", [False, True])
-def test_registration_digest_reads_formats_only_for_excluded_tensors(tensor_runtime, monkeypatch, exclude_shared):
+def test_registration_digest_reuses_captured_formats(tensor_runtime, monkeypatch):
     layout = tensor_runtime.tensor_layout
     transfer = tensor_runtime.transfer_backend
     model = torch.nn.Module()
@@ -528,11 +519,9 @@ def test_registration_digest_reads_formats_only_for_excluded_tensors(tensor_runt
         batch_unregister_memory=lambda addresses: success,
     )
     backend._memory_registration_cls = lambda *fields: fields
-    excluded = [(model.shared.data_ptr(), model.shared.numel() * model.shared.element_size())]
+    assert backend.register_memory_region(model, True)
 
-    assert backend.register_memory_region(model, True, excluded if exclude_shared else None)
-
-    assert layout_reads.call_count == (1 if exclude_shared else 0)
+    assert layout_reads.call_count == 0
     layout_reads.reset_mock()
     assert backend.registered_structural_digest == layout.build_structural_digest(inventory)
     assert backend.unregister_memory_region()

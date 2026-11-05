@@ -250,50 +250,7 @@ def test_rfork_session_receives_parallel_ranks(monkeypatch):
     assert captured["identity"].global_rank == 11
 
 
-def test_rfork_target_registered_blocks_not_collected_for_target_model():
-    load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
-    loader = RForkModelLoader(load_config)
-    load_config.rfork_session = SimpleNamespace(
-        transfer_backend=SimpleNamespace(snapshot_registered_weight_blocks=lambda: [(128, 4096)])
-    )
-    target_model_config = SimpleNamespace()
-    vllm_config = _vllm_config(model_config=target_model_config)
-
-    assert loader._get_target_registered_blocks(vllm_config, target_model_config) == []
-
-
-def test_rfork_target_registered_blocks_collected_for_draft_model():
-    load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
-    loader = RForkModelLoader(load_config)
-    draft_model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5_mtp"))
-    target_blocks = [(128, 4096), (8192, 1024)]
-    load_config.rfork_session = SimpleNamespace(
-        transfer_backend=SimpleNamespace(snapshot_registered_weight_blocks=lambda: list(target_blocks))
-    )
-    vllm_config = _vllm_config(model_config=draft_model_config)
-
-    blocks = loader._get_target_registered_blocks(vllm_config, draft_model_config)
-
-    assert blocks == target_blocks
-    assert blocks is not target_blocks
-
-
-def test_rfork_target_blocks_use_main_load_config_for_an_independent_draft_loader():
-    target_load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
-    draft_load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
-    loader = RForkModelLoader(draft_load_config)
-    target_blocks = [(128, 4096)]
-    target_load_config.rfork_session = SimpleNamespace(
-        transfer_backend=SimpleNamespace(snapshot_registered_weight_blocks=lambda: list(target_blocks))
-    )
-    draft_model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="qwen3_5_mtp"))
-    vllm_config = _vllm_config(model_config=draft_model_config)
-    vllm_config.load_config = target_load_config
-
-    assert loader._get_target_registered_blocks(vllm_config, draft_model_config) == target_blocks
-
-
-def test_rfork_draft_load_passes_target_registered_blocks_to_session(monkeypatch):
+def test_rfork_draft_load_registers_and_transfers_its_own_weights(monkeypatch):
     import vllm.model_executor.model_loader as model_loader
 
     load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
@@ -304,19 +261,11 @@ def test_rfork_draft_load_passes_target_registered_blocks_to_session(monkeypatch
         hf_config=SimpleNamespace(model_type="qwen3_5_mtp"),
     )
     vllm_config = _vllm_config(model_config=draft_model_config)
-    target_blocks = [(128, 4096)]
-    load_config.rfork_session = SimpleNamespace(
-        transfer_backend=SimpleNamespace(snapshot_registered_weight_blocks=lambda: list(target_blocks))
-    )
-    captured_blocks = []
     events = []
 
     class _DraftSession:
-        def can_reuse_shared_weights(self, model, processed_layout, exclude_blocks):
-            return False
-
-        def register_destination(self, model, processed_layout, exclude_blocks=None):
-            captured_blocks.append(list(exclude_blocks or []))
+        def register_destination(self, model, processed_layout):
+            events.append("register")
             return True
 
         def acquire_seed(self):
@@ -330,9 +279,8 @@ def test_rfork_draft_load_passes_target_registered_blocks_to_session(monkeypatch
         def log_transferred_model_layout(self, model, processed_layout):
             events.append("layout_summary")
 
-        def start_seed_service(self, model, processed_layout, exclude_blocks=None, *, structural_digest=None):
+        def start_seed_service(self, model, processed_layout, *, structural_digest=None):
             events.append("start_seed_service")
-            captured_blocks.append(list(exclude_blocks or []))
             return True
 
         def prepare_for_fallback(self):
@@ -372,7 +320,7 @@ def test_rfork_draft_load_passes_target_registered_blocks_to_session(monkeypatch
     model = loader.load_model(vllm_config=vllm_config, model_config=draft_model_config)
 
     assert model is expected_model
-    assert captured_blocks == [target_blocks, target_blocks]
+    assert events == ["register", "seed", "transfer", "layout_summary", "start_seed_service"]
 
 
 @pytest.mark.parametrize("processed_layout", [False, True])
@@ -393,7 +341,7 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
     model = _Model()
 
     class _Session:
-        def register_destination(self, model, processed_layout, exclude_blocks=None):
+        def register_destination(self, model, processed_layout):
             return True
 
         def acquire_seed(self):
@@ -409,7 +357,7 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
             events.append("layout_summary")
             return "final-digest"
 
-        def start_seed_service(self, model, processed_layout, exclude_blocks=None, *, structural_digest=None):
+        def start_seed_service(self, model, processed_layout, *, structural_digest=None):
             assert structural_digest == "final-digest"
             events.append("start_seed_service")
             return True
@@ -472,7 +420,7 @@ def test_rfork_model_preparation_failure_does_not_acquire_seed(monkeypatch, fail
     )
 
     class _Session:
-        def register_destination(self, model, processed_layout, exclude_blocks=None):
+        def register_destination(self, model, processed_layout):
             return True
 
         def acquire_seed(self):
@@ -482,7 +430,7 @@ def test_rfork_model_preparation_failure_does_not_acquire_seed(monkeypatch, fail
         def prepare_for_fallback(self):
             return RForkFallbackCleanupResult(True, True, True)
 
-        def start_seed_service(self, model, processed_layout, exclude_blocks=None, *, structural_digest=None):
+        def start_seed_service(self, model, processed_layout, *, structural_digest=None):
             return True
 
     session = _Session()
@@ -740,7 +688,7 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
     class _Session:
         identity = SimpleNamespace(is_draft_model=False)
 
-        def register_destination(self, model, processed_layout, exclude_blocks=None):
+        def register_destination(self, model, processed_layout):
             return True
 
         def acquire_seed(self):
@@ -754,7 +702,7 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
         def log_transferred_model_layout(self, model, processed_layout):
             events.append("layout_summary")
 
-        def start_seed_service(self, model, processed_layout, exclude_blocks=None, *, structural_digest=None):
+        def start_seed_service(self, model, processed_layout, *, structural_digest=None):
             events.append("start_seed_service")
             return RForkSeedServiceStartResult.FAILED
 
@@ -804,7 +752,7 @@ def test_rfork_fallback_seed_is_deferred_when_only_lease_release_is_pending(monk
     seed_start_models = []
 
     class _Session:
-        def register_destination(self, model, processed_layout, exclude_blocks=None):
+        def register_destination(self, model, processed_layout):
             return True
 
         def acquire_seed(self):
@@ -816,7 +764,7 @@ def test_rfork_fallback_seed_is_deferred_when_only_lease_release_is_pending(monk
         def prepare_for_fallback(self):
             return RForkFallbackCleanupResult(service_stopped=True, lease_released=False, memory_reset=True)
 
-        def start_seed_service(self, model, processed_layout, exclude_blocks=None, *, structural_digest=None):
+        def start_seed_service(self, model, processed_layout, *, structural_digest=None):
             seed_start_models.append(model)
             return RForkSeedServiceStartResult.DEFERRED
 
@@ -915,11 +863,11 @@ def test_rfork_fallback_clears_only_failed_model_state_before_reinit(monkeypatch
         return expected_model
 
     rfork_session = SimpleNamespace(
-        register_destination=lambda model, processed_layout, exclude_blocks=None: True,
+        register_destination=lambda model, processed_layout: True,
         acquire_seed=lambda: True,
         transfer_from_seed=lambda model, processed_layout: False,
         prepare_for_fallback=lambda: RForkFallbackCleanupResult(True, True, True),
-        start_seed_service=lambda model, processed_layout, exclude_blocks=None, **kwargs: True,
+        start_seed_service=lambda model, processed_layout, **kwargs: True,
     )
 
     monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: rfork_session)
@@ -999,10 +947,10 @@ def test_rfork_seed_miss_fallback_preserves_existing_process_global_state(monkey
         return expected_model
 
     rfork_session = SimpleNamespace(
-        register_destination=lambda model, processed_layout, exclude_blocks=None: True,
+        register_destination=lambda model, processed_layout: True,
         acquire_seed=lambda: False,
         prepare_for_fallback=lambda: RForkFallbackCleanupResult(True, True, True),
-        start_seed_service=lambda model, processed_layout, exclude_blocks=None, **kwargs: True,
+        start_seed_service=lambda model, processed_layout, **kwargs: True,
     )
 
     monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: rfork_session)

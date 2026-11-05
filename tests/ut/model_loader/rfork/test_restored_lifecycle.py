@@ -354,7 +354,7 @@ def test_checkpoint_names_reject_unavailable_metadata(
 
 @pytest.mark.parametrize("processed_layout", [False, True])
 @pytest.mark.parametrize(
-    "outcome", ["transfer", "shared", "local", "transfer_error", "metadata_error", "state_error", "other_model"]
+    "outcome", ["transfer", "local", "transfer_error", "metadata_error", "state_error", "other_model"]
 )
 def test_model_state_preparation_precedes_registration_and_guards_fallback(
     rfork_helpers, monkeypatch, processed_layout, outcome
@@ -411,14 +411,13 @@ def test_model_state_preparation_precedes_registration_and_guards_fallback(
 
     def record(event, result=None):
         events.append(event)
-        if event in ("shared", "process", "register") and outcome != "other_model":
+        if event in ("process", "register") and outcome != "other_model":
             live_model = model_ref()
             assert isinstance(live_model, Model)
             assert live_model.has_own_lm_head is True
         return result
 
     session = SimpleNamespace(
-        can_reuse_shared_weights=lambda *args: record("shared", outcome == "shared"),
         register_destination=lambda *args: record("register", True),
         acquire_seed=lambda: record("acquire", outcome != "local"),
         transfer_from_seed=lambda *args: record("transfer", outcome != "transfer_error"),
@@ -428,7 +427,6 @@ def test_model_state_preparation_precedes_registration_and_guards_fallback(
     loader = module.RForkModelLoader.__new__(module.RForkModelLoader)
     loader.load_config = SimpleNamespace(device=None)
     monkeypatch.setattr(loader, "_ensure_rfork_session", lambda *args: session)
-    monkeypatch.setattr(loader, "_get_target_registered_blocks", lambda *args: [(1, 2)])
     monkeypatch.setattr(loader, "_requires_processed_layout_transfer", lambda *args: processed_layout)
     monkeypatch.setattr(module, "_get_checkpoint_weight_names", metadata)
     monkeypatch.setattr(module, "initialize_model", initialize)
@@ -455,12 +453,9 @@ def test_model_state_preparation_precedes_registration_and_guards_fallback(
     if outcome in ("metadata_error", "state_error"):
         assert result is fallback_model
         assert events == prefix + ["cleanup", "default"]
-    elif outcome == "shared":
-        assert result is model_ref()
-        assert events == prefix + ["shared"]
     else:
         assert result is (fallback_model if outcome in ("local", "transfer_error") else model_ref())
-        expected = prefix + ["shared"] + (["process"] if processed_layout else []) + ["register", "acquire"]
+        expected = prefix + (["process"] if processed_layout else []) + ["register", "acquire"]
         if outcome in ("local", "transfer_error"):
             expected += ([] if outcome == "local" else ["transfer"]) + ["cleanup", "default", "seed"]
         else:

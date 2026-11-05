@@ -302,20 +302,8 @@ def test_host_table_is_ready_but_only_device_weight_is_registered(
 
 
 @pytest.mark.parametrize("processed", [False, True])
-@pytest.mark.parametrize(
-    ("reuse", "outcome"),
-    [
-        (False, "transfer"),
-        (False, "seed_miss"),
-        (False, "local_failure"),
-        (False, "release_failure"),
-        (False, "init_failure"),
-        (True, "transfer"),
-    ],
-)
-def test_loader_loads_local_state_before_registration_or_shared_reuse(
-    rfork_helpers, monkeypatch, processed, reuse, outcome
-):
+@pytest.mark.parametrize("outcome", ["transfer", "seed_miss", "local_failure", "release_failure", "init_failure"])
+def test_loader_loads_local_state_before_registration(rfork_helpers, monkeypatch, processed, outcome):
     """Check load/release ordering and prevent unsafe retries after partial construction."""
     runtime = rfork_helpers.loader
     model = torch.nn.Module()
@@ -349,7 +337,6 @@ def test_loader_loads_local_state_before_registration_or_shared_reuse(
         return result
 
     session = SimpleNamespace(
-        can_reuse_shared_weights=lambda *args: record("reuse", reuse),
         register_destination=lambda *args: record("register", True),
         acquire_seed=lambda: outcome not in ("seed_miss", "release_failure"),
         transfer_from_seed=lambda *args: True,
@@ -359,7 +346,6 @@ def test_loader_loads_local_state_before_registration_or_shared_reuse(
     loader = object.__new__(runtime.RForkModelLoader)
     loader.load_config = SimpleNamespace(device=None)
     monkeypatch.setattr(loader, "_ensure_rfork_session", lambda *args: session)
-    monkeypatch.setattr(loader, "_get_target_registered_blocks", lambda *args: [(1, 2)] if reuse else [])
     monkeypatch.setattr(loader, "_requires_processed_layout_transfer", lambda *args: processed)
     monkeypatch.setattr(runtime, "mutable_weights_bypass_reason", lambda *args: None)
     monkeypatch.setattr(runtime, "get_ascend_config", lambda: SimpleNamespace(eplb_config=SimpleNamespace()))
@@ -392,7 +378,7 @@ def test_loader_loads_local_state_before_registration_or_shared_reuse(
         assert error.value.__cause__ is initialization_error
         assert events == ["init_failure"]
         return
-    if outcome == "release_failure" and not reuse:
+    if outcome == "release_failure":
         with pytest.raises(RuntimeError, match="host unregister failed"):
             loader.load_model(*args)
         assert "default" not in events
@@ -401,9 +387,6 @@ def test_loader_loads_local_state_before_registration_or_shared_reuse(
     if outcome == "local_failure":
         assert result is fallback_model
         assert events == ["prepare", "local", "reset", "release", "default", "ready", "seed"]
-    elif reuse:
-        assert result is model
-        assert events == ["prepare", "local", "reuse"]
     elif outcome != "transfer":
         assert result is fallback_model
         assert events == ["prepare", "local", "register", "reset", "release", "default", "ready", "seed"]

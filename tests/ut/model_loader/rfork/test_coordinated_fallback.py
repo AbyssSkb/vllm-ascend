@@ -97,10 +97,6 @@ def cluster(request, monkeypatch):
             fail("cleanup")
             return SimpleNamespace(can_schedule_seed=True)
 
-        def can_reuse_shared_weights(self, *args):
-            return local.rank in reuse
-
-    reuse: set[int] = set()
     monkeypatch.setattr(module, "initialize_model", initialize)
     monkeypatch.setattr(module, "release_local_weights", release)
     monkeypatch.setattr(module, "_load_with_default_loader", fallback)
@@ -112,7 +108,6 @@ def cluster(request, monkeypatch):
             loader = object.__new__(module.RForkModelLoader)
             loader.load_config = SimpleNamespace(device=None)
             loader._requires_processed_layout_transfer = lambda mc: True
-            loader._get_target_registered_blocks = lambda *args: [(1, 1)] if reuse else []
 
             def session(*args):
                 fail("session")
@@ -132,7 +127,7 @@ def cluster(request, monkeypatch):
         with ThreadPoolExecutor(max_workers=size) as pool:
             return list(pool.map(worker, range(size)))
 
-    return SimpleNamespace(run=run, errors=errors, events=events, reuse=reuse)
+    return SimpleNamespace(run=run, errors=errors, events=events)
 
 
 @pytest.mark.parametrize("stage", ["prepare", "host_load", "seed_miss", "register", "transfer", "finalize"])
@@ -171,20 +166,6 @@ def test_unrecoverable_error_aborts_all_ranks(cluster, stage):
     assert not any(event in ("fallback", "publish", "return") for _, event in cluster.events)
 
 
-def test_mixed_draft_reuse_aborts_without_mutating_shared_target(cluster):
-    cluster.reuse.add(2)
-    results = cluster.run()
-    assert all(isinstance(result, RuntimeError) for result in results), results
-    assert not any(event in ("transfer", "fallback", "publish", "return") for _, event in cluster.events)
-
-
-def test_unanimous_draft_reuse_returns_without_transfer(cluster):
-    cluster.reuse.update(range(4))
-    results = cluster.run()
-    assert all(isinstance(result, torch.nn.Module) for result in results), results
-    assert not any(event in ("transfer", "fallback", "publish") for _, event in cluster.events)
-
-
 @pytest.mark.parametrize("engram,world_size", [(None, 4), (object(), 1)])
 def test_no_coordination_without_engram_or_with_one_rank(request, monkeypatch, engram, world_size):
     _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.local_weights", "local_weights.py")
@@ -201,5 +182,3 @@ def test_no_coordination_without_engram_or_with_one_rank(request, monkeypatch, e
     with pytest.raises(RuntimeError) as caught, coordinator.stage("transfer"):
         raise original
     assert caught.value is original
-    assert coordinator.reuse_shared_weights(True)
-    assert not coordinator.reuse_shared_weights(False)

@@ -161,7 +161,7 @@ def test_retry_acknowledgement_promotes_the_model_once(runtime, monkeypatch):
     session.lease_release_thread.join(2)
 
     assert session.seed_lease is None
-    promote.assert_called_once_with(model, True, None)
+    promote.assert_called_once_with(model, True)
     assert session.planner.release_seed_once.call_count == 2
 
 

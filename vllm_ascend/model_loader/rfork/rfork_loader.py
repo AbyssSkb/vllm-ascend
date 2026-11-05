@@ -89,7 +89,6 @@ class _RForkLoadCoordinator:
 
     def __init__(self, vllm_config: VllmConfig):
         self.group: torch.distributed.ProcessGroup | None = None
-        self.size = 1
         if getattr(vllm_config, "engram_config", None) is None:
             return
         from vllm.distributed.parallel_state import get_world_group
@@ -98,7 +97,6 @@ class _RForkLoadCoordinator:
         world = get_world_group()
         if world.world_size > 1:
             self.group = world.cpu_group
-            self.size = world.world_size
 
     def _reduce(self, value: int, op: torch.distributed.ReduceOp) -> int:
         if self.group is None:
@@ -130,15 +128,6 @@ class _RForkLoadCoordinator:
             if error is None:
                 raise RuntimeError(f"RFork peer failed during {name}; coordinated fallback required.")
             raise error
-
-    def reuse_shared_weights(self, can_reuse: bool) -> bool:
-        if self.group is None:
-            return can_reuse
-        count = self._reduce(int(can_reuse), torch.distributed.ReduceOp.SUM)
-        if count not in (0, self.size):
-            # Processing a reusable draft can mutate target-owned storage.
-            raise _RForkLoadAborted("RFork draft weight reuse differs across ranks; restart the workers.")
-        return count == self.size
 
 
 @dataclass
@@ -179,15 +168,12 @@ def _start_rfork_seed_service(
     session: RForkSession,
     model: Module,
     processed_layout: bool,
-    exclude_blocks: list[tuple[int, int]],
     *,
     load_source: str,
     structural_digest: str | None = None,
 ) -> bool:
     try:
-        result = session.start_seed_service(
-            model, processed_layout, exclude_blocks, structural_digest=structural_digest
-        )
+        result = session.start_seed_service(model, processed_layout, structural_digest=structural_digest)
     except Exception:
         logger.exception(
             "RFork %s model loaded from %s, but seed service startup raised; inference can continue.",
@@ -727,23 +713,6 @@ class RForkModelLoader(BaseModelLoader):
             )
         return session
 
-    def _get_target_registered_blocks(
-        self,
-        vllm_config: VllmConfig,
-        model_config: ModelConfig,
-    ) -> list[tuple[int, int]]:
-        if not _is_draft_model(vllm_config, model_config):
-            return []
-        target_load_config = getattr(vllm_config, "load_config", None)
-        target_session = getattr(target_load_config, "rfork_session", None)
-        if target_session is None:
-            target_session = getattr(self.load_config, "rfork_session", None)
-        target_transfer_backend = getattr(target_session, "transfer_backend", None)
-        if target_transfer_backend is None:
-            return []
-        # Snapshot under the backend lock while target storage stays alive during draft preparation.
-        return target_transfer_backend.snapshot_registered_weight_blocks()
-
     def _requires_processed_layout_transfer(self, model_config: ModelConfig) -> bool:
         if getattr(model_config, "quantization", None) is not None:
             return True
@@ -783,7 +752,6 @@ class RForkModelLoader(BaseModelLoader):
                 model: Module | None = None
                 session: RForkSession | None = None
                 model_state_snapshot: _RForkProcessGlobalModelState | None = None
-                exclude_blocks: list[tuple[int, int]] = []
                 model_state_prepared = True
                 processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
                 bypass_reason = mutable_weights_bypass_reason(vllm_config, model_config)
@@ -808,7 +776,6 @@ class RForkModelLoader(BaseModelLoader):
                     # Keep session and TransferEngine initialization inside fallback-protected RFork loading.
                     with coordinator.stage("session setup"), timing.stage("session_setup"):
                         session = self._ensure_rfork_session(vllm_config, model_config)
-                        exclude_blocks = self._get_target_registered_blocks(vllm_config, model_config)
                         model_state_snapshot = _snapshot_process_global_model_state(vllm_config)
                     with coordinator.stage("model construction", fallback=False), timing.stage("model_construction"):
                         model_init_started = True
@@ -833,21 +800,6 @@ class RForkModelLoader(BaseModelLoader):
                     with coordinator.stage("host weight loading"), timing.stage("host_weight_loading"):
                         load_local_weights(model)
 
-                    with coordinator.stage("shared weight inspection"), timing.stage("shared_weight_inspection"):
-                        can_reuse = bool(exclude_blocks) and session.can_reuse_shared_weights(
-                            model, processed_layout_transfer, exclude_blocks
-                        )
-                    if coordinator.reuse_shared_weights(can_reuse):
-                        # Skip hooks because reprocessing can mutate or rebind target-shared storage.
-                        with (
-                            coordinator.stage("shared weight finalization", fallback=False),
-                            timing.stage("shared_weight_finalization"),
-                        ):
-                            model = model.eval()
-                        source = "shared_target"
-                        _log_rfork_load_summary(session, "shared_target", load_started_at)
-                        return model
-
                     with coordinator.stage("transfer layout preparation"), timing.stage("transfer_layout_preparation"):
                         if processed_layout_transfer:
                             layout_start_time = time.perf_counter()
@@ -868,7 +820,7 @@ class RForkModelLoader(BaseModelLoader):
                     with coordinator.stage("weight transfer"), timing.stage("weight_transfer"):
                         weight_load_start_time = time.perf_counter()
                         timing.mark("destination_registration")
-                        if not session.register_destination(model, processed_layout_transfer, exclude_blocks):
+                        if not session.register_destination(model, processed_layout_transfer):
                             raise RuntimeError("destination registration failed.")
 
                         timing.mark("seed_acquisition")
@@ -911,7 +863,6 @@ class RForkModelLoader(BaseModelLoader):
                         session,
                         model,
                         processed_layout_transfer,
-                        exclude_blocks,
                         load_source="transfer",
                         structural_digest=structural_digest,
                     )
@@ -994,7 +945,6 @@ class RForkModelLoader(BaseModelLoader):
                         session,
                         model,
                         processed_layout_transfer,
-                        exclude_blocks,
                         load_source="fallback",
                     )
                     timing.mark("coordination_and_overhead")
