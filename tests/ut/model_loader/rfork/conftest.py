@@ -68,6 +68,7 @@ def runtime(monkeypatch, local_weights, ascend_envs):
     types = load("types")
     config = load("config")
     load("manifest")
+    load("timing")
     load("tensor_layout")
     load("seed_client")
     client = load("planner_client")
@@ -112,6 +113,7 @@ def tensor_runtime(monkeypatch, local_weights):
 
     _stub(monkeypatch, "vllm_ascend.model_loader.rfork.types", SeedTransferInfo=_SeedTransferInfo)
     _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.manifest", "manifest.py")
+    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.timing", "timing.py")
     tensor_layout = _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.tensor_layout", "tensor_layout.py")
     transfer_backend = _load_module(
         monkeypatch, "vllm_ascend.model_loader.rfork.transfer_backend", "transfer_backend.py"
@@ -185,6 +187,7 @@ def rfork_helpers(monkeypatch, local_weights):
     install("vllm_ascend.device.hardware_profile", get_current_hardware_profile=lambda: SimpleNamespace())
     package("vllm_ascend.model_loader")
     package("vllm_ascend.model_loader.rfork")
+    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.timing", "timing.py")
 
     safety = _load_module(monkeypatch, "rfork_restored_lifecycle_safety", "safety.py")
     install("vllm_ascend.model_loader.rfork.safety", mutable_weights_bypass_reason=safety.mutable_weights_bypass_reason)

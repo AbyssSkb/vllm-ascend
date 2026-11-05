@@ -33,6 +33,7 @@ from vllm_ascend.model_loader.rfork.tensor_layout import (
     reshape_tensor_to_seed_shape,
     validate_transferable_tensor_layout,
 )
+from vllm_ascend.model_loader.rfork.timing import StageTimer
 from vllm_ascend.model_loader.rfork.types import SeedTransferInfo
 
 MAX_TRANSFER_CHUNK_BYTES = 1024**3
@@ -341,11 +342,29 @@ class RForkTransferBackend:
         processed_layout: bool,
         exclude_blocks: list[tuple[int, int]] | None = None,
     ) -> bool:
-        with self._lifecycle_lock:
-            # Initialize native resources on the NPU caller thread only when registration is required.
-            if self.transfer_engine is None:
-                self._initialize_transfer_engine()
-            return self._register_memory_region_locked(model, processed_layout, exclude_blocks)
+        timing = StageTimer("lock_wait")
+        outcome = "exception"
+        try:
+            with self._lifecycle_lock:
+                try:
+                    timing.mark("engine_init")
+                    if self.transfer_engine is None:
+                        self._initialize_transfer_engine()
+                    timing.mark("device_check")
+                    registered = self._register_memory_region_locked(model, processed_layout, exclude_blocks, timing)
+                    outcome = "success" if registered else "failed"
+                    return registered
+                finally:
+                    timing.mark("lock_release")
+        finally:
+            total_s, stages_s = timing.finish()
+            logger.info(
+                "RFork registration timing: scope=register_memory_region relation=nested "
+                "outcome=%s total_s=%.6f stages_s=%s",
+                outcome,
+                total_s,
+                stages_s,
+            )
 
     def can_reuse_shared_weights(self, model, processed_layout: bool, exclude_blocks: list[tuple[int, int]]) -> bool:
         """Whether every live weight is already owned by the loaded target model."""
@@ -360,7 +379,8 @@ class RForkTransferBackend:
         self,
         model,
         processed_layout: bool,
-        exclude_blocks: list[tuple[int, int]] | None = None,
+        exclude_blocks: list[tuple[int, int]] | None,
+        timing: StageTimer,
     ) -> bool:
         transfer_engine = self._engine()
         start_reg_mr_time = time.perf_counter()
@@ -373,6 +393,7 @@ class RForkTransferBackend:
             )
             return False
 
+        timing.mark("stale_cleanup")
         if self.registered_weight_blocks or self.registered_memory_addresses:
             stale_block_count = len(self.registered_weight_blocks)
             if not self._unregister_weight_blocks(transfer_engine):
@@ -382,6 +403,7 @@ class RForkTransferBackend:
                 stale_block_count,
             )
 
+        timing.mark("collect")
         excluded_blocks = list(exclude_blocks) if exclude_blocks else []
         self.excluded_weight_blocks = excluded_blocks
         all_transferable_tensors = list(collect_transferable_tensors(model, processed_layout))
@@ -408,6 +430,7 @@ class RForkTransferBackend:
             logger.error("RFork refuses a manifest with duplicate or empty tensor names.")
             return False
 
+        timing.mark("manifest")
         weight_mr_dict: dict[str, Any] = {}
         weight_format_dict: dict[str, int] = {}
         tensor_ranges: list[tuple[int, int]] = []
@@ -438,14 +461,17 @@ class RForkTransferBackend:
             weight_format_dict[name] = weight_format
             tensor_ranges.append((weight_ptr, weight_ptr + weight_numel * weight_size))
 
+        timing.mark("digest")
         structural_digest = build_structural_digest(all_transferable_tensors, known_formats=weight_format_dict)
 
+        timing.mark("memory_snapshot")
         try:
             memory_snapshot = torch.npu.memory.memory_snapshot()
         except Exception as exc:
             logger.error("Failed to snapshot NPU memory for RFork registration: %s", exc)
             return False
 
+        timing.mark("block_plan")
         merged_blocks = _select_weight_blocks(memory_snapshot, tensor_ranges)
         merged_blocks = _subtract_weight_blocks(merged_blocks, excluded_blocks)
         backing_starts = [start for start, _ in merged_blocks]
@@ -479,6 +505,7 @@ class RForkTransferBackend:
             else:
                 logical_registrations.append((tensor_start, tensor_end - tensor_start, backing_start, backing_size))
 
+        timing.mark("native_register_overhead")
         registered_memory_addresses: list[int] = []
         # Retain provisional metadata and owners before registration so failures remain recoverable.
         self.weight_manifest = weight_mr_dict
@@ -507,7 +534,11 @@ class RForkTransferBackend:
                 _append_unique_addresses(self.registered_memory_addresses, attempted_addresses)
                 try:
                     registrations = [memory_registration_cls(*registration) for registration in registration_batch]
-                    result = batch_register_memory_ex(registrations)
+                    timing.mark("native_calls")
+                    try:
+                        result = batch_register_memory_ex(registrations)
+                    finally:
+                        timing.mark("native_register_overhead")
                 except Exception as exc:
                     logger.error(
                         "TransferEngine memory registration raised for batch of %d logical regions: %s",
@@ -523,6 +554,7 @@ class RForkTransferBackend:
                             len(registration_batch),
                             result.to_string(),
                         )
+                    timing.mark("registration_rollback")
                     # Retain every attempted address and owner until unregistration confirms absence.
                     if self.registered_memory_addresses and not self._unregister_weight_blocks(transfer_engine):
                         logger.error(
@@ -540,6 +572,7 @@ class RForkTransferBackend:
             time.perf_counter() - start_reg_mr_time,
             len(weight_mr_dict),
         )
+        timing.mark("layout_summary")
         log_tensor_layout_summary(
             transferable_tensors,
             stage="registration",
