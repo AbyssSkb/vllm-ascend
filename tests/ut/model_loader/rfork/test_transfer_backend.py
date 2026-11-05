@@ -35,10 +35,7 @@ from vllm_ascend.model_loader.rfork.types import SeedTransferInfo
 
 @pytest.fixture(autouse=True)
 def _mock_cpu_tensor_npu_format(monkeypatch):
-    import vllm_ascend.model_loader.rfork.manifest as rfork_manifest
-
     monkeypatch.setattr(transfer_backend, "read_npu_format", lambda tensor: 0)
-    monkeypatch.setattr(rfork_manifest, "read_npu_format", lambda tensor: 0)
 
 
 def _append_and_return(items: list[Any], value: Any, result: Any) -> Any:
@@ -83,7 +80,7 @@ def test_registration_requires_full_coverage_across_allocator_blocks(monkeypatch
             {"address": start, "size": 4, "state": "active_allocated"},
         ],
     )
-    assert backend.register_memory_region(object(), False) is (gap == 0)
+    assert backend.register_memory_region(object()) is (gap == 0)
     assert bool(registrations) is (gap == 0)
 
 
@@ -97,9 +94,9 @@ def test_first_registration_rejects_transfer_engine_without_memory_registration(
     monkeypatch.setitem(sys.modules, "yr.datasystem", datasystem_module)
 
     backend = RForkTransferBackend()
-    assert not backend._is_initialized
+    assert backend.transfer_engine is None
     with pytest.raises(ImportError, match="MemoryRegistration"):
-        backend.register_memory_region(object(), False)
+        backend.register_memory_region(object())
     assert backend.unregister_memory_region()
     assert backend.finalize_transfer_engine()
 
@@ -153,7 +150,7 @@ def test_initialize_transfer_engine_binds_dynamic_port_and_reads_rpc_port(monkey
     assert engine.initialize_calls == [("10.0.0.1:0", "ascend", "npu:2")]
     assert backend.transfer_session_id == "10.0.0.1:45678"
     assert backend.transfer_engine is engine
-    assert backend._is_initialized
+    assert backend.transfer_engine is not None
 
 
 @pytest.mark.parametrize("rpc_port", [0, -1, 65536, None])
@@ -166,7 +163,6 @@ def test_initialize_transfer_engine_rejects_invalid_rpc_port(monkeypatch, rpc_po
 
     assert engine.finalize_calls == 1
     assert backend.transfer_engine is None
-    assert not backend._is_initialized
 
 
 def test_initialize_transfer_engine_requires_get_rpc_port(monkeypatch):
@@ -177,6 +173,23 @@ def test_initialize_transfer_engine_requires_get_rpc_port(monkeypatch):
     backend = RForkTransferBackend()
 
     with pytest.raises(RuntimeError, match="get_rpc_port"):
+        backend._initialize_transfer_engine()
+
+    assert engine.finalize_calls == 1
+    assert backend.transfer_engine is None
+
+
+def test_initialize_transfer_engine_finalizes_if_session_address_fails(monkeypatch):
+    engine = _install_yr_module_with_engine(monkeypatch, _FakeYrEngine(rpc_port=45678))
+    backend = RForkTransferBackend()
+
+    def join(host, port):
+        if port:
+            raise ValueError("invalid session address")
+        return f"{host}:0"
+
+    monkeypatch.setattr(transfer_backend, "join_host_port", join)
+    with pytest.raises(ValueError, match="invalid session address"):
         backend._initialize_transfer_engine()
 
     assert engine.finalize_calls == 1
@@ -196,7 +209,6 @@ def test_initialize_transfer_engine_finalizes_engine_when_rpc_port_raises(monkey
 
     assert engine.finalize_calls == 1
     assert backend.transfer_engine is None
-    assert not backend._is_initialized
 
 
 def test_initialize_transfer_engine_propagates_initialize_failure(monkeypatch):
@@ -209,7 +221,6 @@ def test_initialize_transfer_engine_propagates_initialize_failure(monkeypatch):
     assert engine.initialize_calls == [("10.0.0.1:0", "ascend", "npu:2")]
     assert engine.finalize_calls == 0
     assert backend.transfer_engine is None
-    assert not backend._is_initialized
 
 
 def test_iter_transfer_chunks_splits_single_large_tensor():
@@ -231,56 +242,27 @@ def test_iter_transfer_chunks_splits_single_large_tensor():
     assert chunks[1][2] == [20_000 + chunk_limit]
 
 
-def test_read_weights_from_seed_refreshes_registered_shape_after_reshape(monkeypatch):
-    tensor = torch.arange(6).reshape(2, 3)
-    backend = RForkTransferBackend()
-    backend.transfer_engine = SimpleNamespace(
-        batch_transfer_sync_read=lambda *args: SimpleNamespace(is_error=lambda: False)
-    )
-    backend.weight_manifest = {"weight": (tensor.data_ptr(), tensor.numel(), tensor.element_size(), (2, 3), "int64")}
-    backend._registered_transferable_tensors = [("weight", tensor)]
-
-    monkeypatch.setattr(
-        transfer_backend,
-        "collect_transferable_tensors",
-        lambda model, processed_layout: [("weight", tensor)],
-    )
-    seed_info = SeedTransferInfo(
-        "seed-session",
-        {"weight": [1, tensor.numel(), tensor.element_size(), [1, 2, 3], "int64"]},
-        formats={"weight": 0},
-    )
-
-    assert backend.read_weights_from_seed(object(), seed_info, True)
-    assert tuple(tensor.shape) == (1, 2, 3)
-    assert backend.weight_manifest["weight"][3] == (1, 2, 3)
-    assert backend.weight_manifest["weight"][4] == "int64"
-
-
 def test_read_weights_from_seed_retains_registered_transferable_tensor_owners(monkeypatch):
     tensor = torch.arange(6).reshape(2, 3)
     tensor_ref = weakref.ref(tensor)
-    tensor_numel = tensor.numel()
-    tensor_element_size = tensor.element_size()
     backend = RForkTransferBackend()
     backend.transfer_engine = SimpleNamespace(
         batch_transfer_sync_read=lambda *args: SimpleNamespace(is_error=lambda: False)
     )
     registered_tensors = [("weight", tensor)]
-    backend._registered_transferable_tensors = registered_tensors
+    backend._registered_tensors = registered_tensors
 
-    def fail_if_rescanned(model, processed_layout):
+    def fail_if_rescanned(model):
         raise AssertionError("read_weights_from_seed should reuse the registered tensor cache")
 
     monkeypatch.setattr(transfer_backend, "collect_transferable_tensors", fail_if_rescanned)
     seed_info = SeedTransferInfo(
         "seed-session",
-        {"weight": [1, tensor_numel, tensor_element_size, [2, 3], "int64"]},
-        formats={"weight": 0},
+        {"weight": 1},
     )
 
-    assert backend.read_weights_from_seed(object(), seed_info, True)
-    assert backend._registered_transferable_tensors is registered_tensors
+    assert backend.read_weights_from_seed(seed_info)
+    assert backend._registered_tensors is registered_tensors
     del registered_tensors
     del tensor
     gc.collect()
@@ -295,12 +277,11 @@ def test_unregister_memory_region_releases_registered_tensor_owners():
     )
     backend.weight_manifest = {"weight": (tensor.data_ptr(), tensor.numel(), 1)}
     backend.registered_memory_addresses = [tensor.data_ptr()]
-    backend._registered_transferable_tensors = [("weight", tensor)]
+    backend._registered_tensors = [("weight", tensor)]
 
     assert backend.unregister_memory_region()
-    assert backend._registered_transferable_tensors is None
+    assert backend._registered_tensors is None
     assert backend.weight_manifest is None
-    assert backend.registered_memory_addresses == []
 
 
 def test_unregister_memory_region_failure_preserves_state_for_retry():
@@ -327,17 +308,15 @@ def test_unregister_memory_region_failure_preserves_state_for_retry():
     backend.transfer_engine = SimpleNamespace(batch_unregister_memory=unregister)
     backend.weight_manifest = {"weight": (tensor.data_ptr(), 6, 1)}
     backend.registered_memory_addresses = [blocks[0][0]]
-    backend._registered_transferable_tensors = owners
+    backend._registered_tensors = owners
 
     assert not backend.unregister_memory_region()
-    assert backend.registered_memory_addresses == [blocks[0][0]]
-    assert backend._registered_transferable_tensors is owners
+    assert backend._registered_tensors is owners
     assert backend.weight_manifest is not None
 
     assert backend.unregister_memory_region()
     assert attempts == [[blocks[0][0]], [blocks[0][0]]]
-    assert backend.registered_memory_addresses == []
-    assert backend._registered_transferable_tensors is None
+    assert backend._registered_tensors is None
 
 
 def test_register_memory_region_uses_logical_ranges_with_allocator_backing(monkeypatch):
@@ -364,10 +343,9 @@ def test_register_memory_region_uses_logical_ranges_with_allocator_backing(monke
     backend._memory_registration_cls = _MemoryRegistration
     backend.registered_memory_addresses = []
     backend.weight_manifest = None
-    backend._registered_transferable_tensors = None
+    backend._registered_tensors = None
 
     monkeypatch.setattr(transfer_backend, "find_non_npu_state_tensors", lambda _model: [])
-    monkeypatch.setattr(transfer_backend, "is_transferable_tensor", lambda _tensor: True)
     monkeypatch.setattr(transfer_backend, "collect_transferable_tensors", lambda *args: [("weight", logical)])
     monkeypatch.setattr(
         transfer_backend.torch,
@@ -390,7 +368,7 @@ def test_register_memory_region_uses_logical_ranges_with_allocator_backing(monke
         raising=False,
     )
 
-    assert backend.register_memory_region(object(), False)
+    assert backend.register_memory_region(object())
     assert registrations == [(logical.data_ptr(), logical.numel(), backing_start, backing_size)]
     assert backend.registered_memory_addresses == [logical.data_ptr()]
 
@@ -418,9 +396,8 @@ def test_extended_registration_merges_overlapping_logical_ranges(monkeypatch):
     )
     backend._memory_registration_cls = _MemoryRegistration
     backend.registered_memory_addresses = []
-    backend._registered_transferable_tensors = None
+    backend._registered_tensors = None
     monkeypatch.setattr(transfer_backend, "find_non_npu_state_tensors", lambda _model: [])
-    monkeypatch.setattr(transfer_backend, "is_transferable_tensor", lambda _tensor: True)
     monkeypatch.setattr(
         transfer_backend,
         "collect_transferable_tensors",
@@ -447,7 +424,7 @@ def test_extended_registration_merges_overlapping_logical_ranges(monkeypatch):
         raising=False,
     )
 
-    assert backend.register_memory_region(object(), False)
+    assert backend.register_memory_region(object())
     assert registrations == [(first.data_ptr(), 6, backing_start, tensor.numel())]
 
 
@@ -474,16 +451,14 @@ def test_finalize_retries_not_ready_and_clears_state_only_after_success():
     backend.transfer_session_id = "session"
     backend.weight_manifest = {"weight": (1, 1, 1)}
     backend.registered_memory_addresses = [1]
-    backend._registered_transferable_tensors = [("weight", torch.ones(1))]
+    backend._registered_tensors = [("weight", torch.ones(1))]
     backend._not_ready_error_code = "not-ready"
-    backend._is_initialized = True
 
     assert backend.finalize_transfer_engine()
     assert len(attempts) == 2
-    assert backend._is_initialized is False
+    assert backend.transfer_engine is None
     assert backend.transfer_session_id is None
-    assert backend.registered_memory_addresses == []
-    assert backend._registered_transferable_tensors is None
+    assert backend._registered_tensors is None
 
 
 def test_finalize_failure_preserves_registered_tensor_owners():
@@ -503,14 +478,12 @@ def test_finalize_failure_preserves_registered_tensor_owners():
     backend.transfer_engine = SimpleNamespace(finalize=lambda: _Ret())
     backend.transfer_session_id = "session"
     backend.registered_memory_addresses = [1]
-    backend._registered_transferable_tensors = owners
+    backend._registered_tensors = owners
     backend._not_ready_error_code = "not-ready"
-    backend._is_initialized = True
 
     assert not backend.finalize_transfer_engine()
-    assert backend._is_initialized is True
-    assert backend.registered_memory_addresses == [1]
-    assert backend._registered_transferable_tensors is owners
+    assert backend.transfer_engine is not None
+    assert backend._registered_tensors is owners
 
 
 def test_transfer_lifecycle_lock_serializes_concurrent_calls():
@@ -529,7 +502,7 @@ def test_transfer_lifecycle_lock_serializes_concurrent_calls():
         return True
 
     backend._read_weights_from_seed_locked = recv_locked  # type: ignore[method-assign]
-    args = (object(), SeedTransferInfo("session", {}, formats={}), False)
+    args = (SeedTransferInfo("session", {}),)
     first = threading.Thread(target=backend.read_weights_from_seed, args=args)
 
     def recv_second():
@@ -560,7 +533,7 @@ def test_register_memory_region_rejects_second_registration_without_overwriting(
     backend.transfer_engine = SimpleNamespace()
     backend.registered_memory_addresses = [123]
     backend.weight_manifest = old_info
-    backend._registered_transferable_tensors = old_owners
+    backend._registered_tensors = old_owners
 
     # A failed unregister keeps its state so the next attempt can retry it.
     monkeypatch.setattr(
@@ -568,10 +541,9 @@ def test_register_memory_region_rejects_second_registration_without_overwriting(
         "collect_transferable_tensors",
         lambda *args: pytest.fail("register_memory_region must not rescan before stale unregister succeeds"),
     )
-    assert not backend.register_memory_region(object(), False)
-    assert backend.registered_memory_addresses == [123]
+    assert not backend.register_memory_region(object())
     assert backend.weight_manifest is old_info
-    assert backend._registered_transferable_tensors is old_owners
+    assert backend._registered_tensors is old_owners
 
 
 def test_register_memory_region_retries_stale_blocks_before_registering(monkeypatch):
@@ -590,11 +562,10 @@ def test_register_memory_region_retries_stale_blocks_before_registering(monkeypa
         stale_blocks=stale_blocks,
     )
 
-    assert backend.register_memory_region(object(), True)
+    assert backend.register_memory_region(object())
 
     assert unregistered_calls == [[stale_blocks[0][0]]]
     assert registrations == [(storage.data_ptr(), storage.numel() * storage.element_size(), storage.data_ptr(), 40)]
-    assert backend.registered_memory_addresses == [storage.data_ptr()]
 
 
 def test_register_memory_region_aborts_when_stale_unregister_fails(monkeypatch):
@@ -614,11 +585,10 @@ def test_register_memory_region_aborts_when_stale_unregister_fails(monkeypatch):
         unregister_error=True,
     )
 
-    assert not backend.register_memory_region(object(), True)
+    assert not backend.register_memory_region(object())
 
     assert registrations == []
     assert unregistered_calls == [[stale_blocks[0][0]]]
-    assert backend.registered_memory_addresses == [stale_blocks[0][0]]
 
 
 def test_unregister_splits_batches_and_preserves_only_unfinished_addresses(monkeypatch):
@@ -634,18 +604,18 @@ def test_unregister_splits_batches_and_preserves_only_unfinished_addresses(monke
     backend = RForkTransferBackend()
     backend.transfer_engine = SimpleNamespace(batch_unregister_memory=batch_unregister_memory)
     backend.registered_memory_addresses = [120, 400, 800]
-    backend._registered_transferable_tensors = [("weight", torch.ones(1))]
+    backend._registered_tensors = [("weight", torch.ones(1))]
     monkeypatch.setattr(transfer_backend, "MAX_MEMORY_REGISTRATION_BATCH_ITEMS", 2)
 
     assert not backend.unregister_memory_region()
     assert calls == [[120, 400], [800]]
     assert backend.registered_memory_addresses == [800]
-    assert backend._registered_transferable_tensors is not None
+    assert backend._registered_tensors is not None
 
     assert backend.unregister_memory_region()
     assert calls[-1] == [800]
     assert backend.registered_memory_addresses == []
-    assert backend._registered_transferable_tensors is None
+    assert backend._registered_tensors is None
 
 
 def test_finalize_stops_after_bounded_not_ready_retries(monkeypatch):
@@ -664,16 +634,11 @@ def test_finalize_stops_after_bounded_not_ready_retries(monkeypatch):
     backend = RForkTransferBackend()
     backend.transfer_engine = SimpleNamespace(finalize=finalize)
     backend._not_ready_error_code = "not-ready"
-    backend._is_initialized = True
     monkeypatch.setattr(transfer_backend.time, "sleep", sleep_calls.append)
 
     assert not backend.finalize_transfer_engine(max_attempts=3, retry_interval_sec=0.25)
     assert len(attempts) == 3
     assert sleep_calls == [0.25, 0.25]
-
-
-# Sentinel so tests can pass ``memory_registration_cls=None`` explicitly.
-_UNSET = object()
 
 
 # Sentinel so tests can pass ``memory_registration_cls=None`` explicitly.
@@ -692,9 +657,6 @@ def _make_register_memory_region_backend(
     """Build a backend with configurable registration failures and engine capabilities."""
     registrations: list[tuple[int, int, int, int]] = []
     unregistered_calls = []
-    monkeypatch.setattr(
-        transfer_backend, "is_transferable_tensor", lambda t: isinstance(t, torch.Tensor) and t.numel() > 0
-    )
 
     class _MemoryRegistration:
         def __init__(self, *values):
@@ -728,11 +690,11 @@ def _make_register_memory_region_backend(
     )
     backend.registered_memory_addresses = [address for address, _ in stale_blocks]
     backend.weight_manifest = None
-    backend._registered_transferable_tensors = None
+    backend._registered_tensors = None
     monkeypatch.setattr(
         transfer_backend,
         "collect_transferable_tensors",
-        lambda model, processed_layout: list(tensors),
+        lambda model: list(tensors),
     )
     snapshot = [{"blocks": snapshot_blocks}]
     monkeypatch.setattr(
@@ -742,34 +704,6 @@ def _make_register_memory_region_backend(
         raising=False,
     )
     return backend, registrations, unregistered_calls
-
-
-def test_register_memory_region_registers_each_model_weight(monkeypatch):
-    storage = torch.arange(100, dtype=torch.float32)
-    embedding = storage[:10]
-    layer = storage[20:32].reshape(2, 6)
-    backend, registrations, _ = _make_register_memory_region_backend(
-        monkeypatch,
-        [("model.embed_tokens.weight", embedding), ("layers.0.fc.weight", layer)],
-        [
-            {
-                "address": storage.data_ptr(),
-                "size": storage.numel() * storage.element_size(),
-                "state": "active_allocated",
-            }
-        ],
-    )
-
-    assert backend.register_memory_region(object(), True)
-    assert set(backend.weight_manifest) == {"model.embed_tokens.weight", "layers.0.fc.weight"}
-    assert [name for name, _ in backend._registered_transferable_tensors] == [
-        "model.embed_tokens.weight",
-        "layers.0.fc.weight",
-    ]
-    assert registrations == [
-        (weight.data_ptr(), weight.numel() * weight.element_size(), storage.data_ptr(), 400)
-        for weight in (embedding, layer)
-    ]
 
 
 def test_register_memory_region_splits_large_registration_batches(monkeypatch):
@@ -788,35 +722,9 @@ def test_register_memory_region_splits_large_registration_batches(monkeypatch):
     )
     monkeypatch.setattr(transfer_backend, "MAX_MEMORY_REGISTRATION_BATCH_ITEMS", 2)
 
-    assert backend.register_memory_region(object(), False)
+    assert backend.register_memory_region(object())
     assert len(registered_calls) == 3
     assert backend.registered_memory_addresses == [weight.data_ptr() for weight in weights]
-
-
-def test_register_publishes_manifest_only_after_all_batches_succeed(monkeypatch):
-    storage = torch.arange(12, dtype=torch.uint8)
-    weights = [storage[0:2], storage[4:6]]
-    backend, _, _ = _make_register_memory_region_backend(
-        monkeypatch,
-        [(f"weight_{index}", weight) for index, weight in enumerate(weights)],
-        [{"address": storage.data_ptr(), "size": storage.numel(), "state": "active_allocated"}],
-    )
-    monkeypatch.setattr(transfer_backend, "MAX_MEMORY_REGISTRATION_BATCH_ITEMS", 1)
-    calls = []
-
-    def register(batch):
-        assert backend.weight_manifest is None
-        assert backend._registered_transferable_tensors is None
-        assert backend.registered_structural_digest is None
-        assert backend._registered_transferable_storages
-        calls.append(batch)
-        return SimpleNamespace(is_error=lambda: False)
-
-    backend.transfer_engine.batch_register_memory_ex = register
-    assert backend.register_memory_region(object(), False)
-    assert len(calls) == 2
-    assert set(backend.weight_manifest) == {"weight_0", "weight_1"}
-    assert backend.registered_structural_digest
 
 
 def _single_block_snapshot(storage):
@@ -849,7 +757,7 @@ def test_register_memory_region_clears_state_when_engine_lacks_registration_supp
         memory_registration_cls=memory_registration_cls,
     )
 
-    assert not backend.register_memory_region(object(), True)
+    assert not backend.register_memory_region(object())
 
     # An engine that cannot register must leave no provisional manifest behind.
     assert registrations == []
@@ -857,8 +765,7 @@ def test_register_memory_region_clears_state_when_engine_lacks_registration_supp
     assert backend.weight_manifest is None
     assert backend.weight_formats is None
     assert backend.registered_memory_addresses == []
-    assert backend.registered_memory_addresses == []
-    assert backend._registered_transferable_tensors is None
+    assert backend._registered_tensors is None
     assert backend._registered_transferable_storages is None
 
 
@@ -872,15 +779,14 @@ def test_register_memory_region_rolls_back_attempted_addresses_when_registration
         register_outcome=register_outcome,
     )
 
-    assert not backend.register_memory_region(object(), True)
+    assert not backend.register_memory_region(object())
 
     # Roll back attempted registrations even when the engine never confirmed them.
     assert registrations == [(storage.data_ptr(), 40, storage.data_ptr(), 40)]
     assert unregistered_calls == [[storage.data_ptr()]]
     assert backend.weight_manifest is None
     assert backend.registered_memory_addresses == []
-    assert backend.registered_memory_addresses == []
-    assert backend._registered_transferable_tensors is None
+    assert backend._registered_tensors is None
 
 
 def test_register_memory_region_retains_owners_when_rollback_also_fails(monkeypatch):
@@ -893,15 +799,15 @@ def test_register_memory_region_retains_owners_when_rollback_also_fails(monkeypa
         register_outcome="error",
     )
 
-    assert not backend.register_memory_region(object(), True)
+    assert not backend.register_memory_region(object())
 
     # Keep addresses and tensor owners pinned when rollback fails so cleanup can retry safely.
     assert unregistered_calls == [[storage.data_ptr()]]
     assert backend.registered_memory_addresses == [storage.data_ptr()]
-    assert backend.registered_memory_addresses == [storage.data_ptr()]
     assert backend.weight_manifest is None
-    assert backend._registered_transferable_tensors is None
-    assert backend._registered_transferable_storages == [storage.untyped_storage()]
+    assert backend._registered_tensors is None
+    assert backend._registered_transferable_storages
+    assert not backend.read_weights_from_seed(SeedTransferInfo("seed", {"weight": storage.data_ptr()}))
 
 
 def test_register_memory_region_rolls_back_earlier_batches_when_a_later_batch_fails(monkeypatch):
@@ -925,46 +831,32 @@ def test_register_memory_region_rolls_back_earlier_batches_when_a_later_batch_fa
 
     backend.transfer_engine.batch_register_memory_ex = batch_register_memory_ex
 
-    assert not backend.register_memory_region(object(), False)
+    assert not backend.register_memory_region(object())
 
     assert len(calls) == 2
     # Roll back both batches using the same limit of one address per call.
     assert unregistered_calls == [[weight.data_ptr()] for weight in weights]
     assert backend.registered_memory_addresses == []
     assert backend.weight_manifest is None
-    assert backend._registered_transferable_tensors is None
+    assert backend._registered_tensors is None
 
 
 def test_read_weights_from_seed_rejects_missing_registration_cache(monkeypatch):
-    storage = torch.arange(100, dtype=torch.float32)
-    own_weight = storage[20:32]
     backend = RForkTransferBackend()
     reads: list[Any] = []
     backend.transfer_engine = SimpleNamespace(
         batch_transfer_sync_read=lambda *args: _append_and_return(reads, args, SimpleNamespace(is_error=lambda: False))
     )
-    backend._registered_transferable_tensors = None
+    backend._registered_tensors = None
 
     def fail_if_rescanned(*_args):
         raise AssertionError("RFork must not rescan tensors after registration is lost")
 
     monkeypatch.setattr(transfer_backend, "collect_transferable_tensors", fail_if_rescanned)
 
-    seed_info = SeedTransferInfo(
-        "seed-session",
-        {
-            "layers.0.fc.weight": [
-                7,
-                own_weight.numel(),
-                own_weight.element_size(),
-                list(own_weight.shape),
-                "float32",
-            ]
-        },
-        formats={"layers.0.fc.weight": 0},
-    )
+    seed_info = SeedTransferInfo("seed-session", {"layers.0.fc.weight": 7})
 
-    assert not backend.read_weights_from_seed(object(), seed_info, True)
+    assert not backend.read_weights_from_seed(seed_info)
     assert reads == []
 
 
@@ -974,31 +866,11 @@ def test_read_weights_from_seed_fails_for_missing_weight(monkeypatch):
     backend.transfer_engine = SimpleNamespace(
         batch_transfer_sync_read=lambda *args: SimpleNamespace(is_error=lambda: False)
     )
-    backend._registered_transferable_tensors = [("layers.0.fc.weight", own_weight)]
+    backend._registered_tensors = [("layers.0.fc.weight", own_weight)]
 
-    seed_info = SeedTransferInfo("seed-session", {}, formats={})
+    seed_info = SeedTransferInfo("seed-session", {})
 
-    assert not backend.read_weights_from_seed(object(), seed_info, True)
-
-
-@pytest.mark.parametrize(
-    "entry",
-    [
-        [1, 6, 4, [6]],
-        [1, 6, 4, [6], "int32"],
-        [1, 6, 4, [7], "float32"],
-    ],
-)
-def test_incompatible_manifest_rejected_before_native_read(monkeypatch, entry):
-    tensor = torch.ones(6, dtype=torch.float32)
-    backend = RForkTransferBackend()
-    calls = []
-    backend.transfer_engine = SimpleNamespace(batch_transfer_sync_read=lambda *args: calls.append(args))
-    backend._registered_transferable_tensors = [("weight", tensor)]
-    seed_info = SeedTransferInfo("session", {"weight": entry}, formats={"weight": 0})
-
-    assert not backend.read_weights_from_seed(object(), seed_info, True)
-    assert calls == []
+    assert not backend.read_weights_from_seed(seed_info)
 
 
 def test_register_memory_region_records_weight_formats(monkeypatch):
@@ -1016,61 +888,6 @@ def test_register_memory_region_records_weight_formats(monkeypatch):
         ],
     )
 
-    assert backend.register_memory_region(object(), False)
+    assert backend.register_memory_region(object())
     assert backend.weight_formats == {"weight": 3}
     assert registrations
-
-
-def _format_read_backend(weight):
-    reads = []
-
-    def read(session_id, destinations, sources, lengths):
-        reads.append(list(zip(destinations, sources, lengths, strict=True)))
-        return SimpleNamespace(is_error=lambda: False)
-
-    backend = RForkTransferBackend()
-    backend.transfer_engine = SimpleNamespace(batch_transfer_sync_read=read)
-    backend._registered_transferable_tensors = [("layers.0.fc.weight", weight)]
-    return backend, reads
-
-
-def _format_seed_info(weight, formats):
-    return SeedTransferInfo(
-        "seed-session",
-        {
-            "layers.0.fc.weight": [
-                7,
-                weight.numel(),
-                weight.element_size(),
-                list(weight.shape),
-                "float32",
-            ]
-        },
-        formats=formats,
-    )
-
-
-@pytest.mark.parametrize(
-    ("formats", "local_format", "expected_success"),
-    [
-        ({"layers.0.fc.weight": 3}, 2, False),
-        ({"layers.0.fc.weight": 2}, 2, True),
-        ({"layers.0.other.weight": 2}, 2, False),
-        ({"layers.0.fc.weight": None}, 2, False),
-        ({"layers.0.fc.weight": "2"}, 2, False),
-        ({"layers.0.fc.weight": True}, 2, False),
-        ({"layers.0.fc.weight": 2}, None, False),
-    ],
-    ids=["divergent", "matching", "malformed-name", "missing", "string", "bool", "unreadable-local"],
-)
-def test_read_weights_from_seed_validates_storage_formats(monkeypatch, formats, local_format, expected_success):
-    import vllm_ascend.model_loader.rfork.manifest as rfork_manifest
-
-    weight = torch.arange(12, dtype=torch.float32)
-    backend, reads = _format_read_backend(weight)
-    monkeypatch.setattr(rfork_manifest, "read_npu_format", lambda tensor: local_format)
-
-    seed_info = _format_seed_info(weight, formats)
-
-    assert backend.read_weights_from_seed(object(), seed_info, False) is expected_success
-    assert len(reads) == int(expected_success)

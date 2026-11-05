@@ -20,7 +20,7 @@ import os
 import sys
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import copy
 from dataclasses import dataclass, fields
 from typing import Any, cast
@@ -44,7 +44,6 @@ from vllm.model_executor.model_loader.utils import (
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.device.hardware_profile import get_current_hardware_profile
 from vllm_ascend.model_loader.rfork.config import (
     RForkConfig,
     RForkConfigurationError,
@@ -62,11 +61,7 @@ from vllm_ascend.model_loader.rfork.local_weights import (
 from vllm_ascend.model_loader.rfork.safety import mutable_weights_bypass_reason
 from vllm_ascend.model_loader.rfork.session import RForkSession
 from vllm_ascend.model_loader.rfork.timing import StageTimer
-from vllm_ascend.model_loader.rfork.types import (
-    RForkFallbackCleanupResult,
-    RForkIdentity,
-    RForkLifecycleState,
-)
+from vllm_ascend.model_loader.rfork.types import RForkIdentity
 
 
 class _RForkSeedUnavailable(RuntimeError):
@@ -153,7 +148,7 @@ def _rfork_model_kind(session: RForkSession) -> str:
 
 
 def _log_rfork_load_summary(session: RForkSession, source: str, started_at: float) -> None:
-    # Exclude background seed publication after loader return.
+    # Include synchronous startup, but not deferred promotion after loader return.
     log_summary = logger.info if _is_rfork_summary_rank(session) else logger.debug
     log_summary(
         "RFork %s model loading completed: source=%s, elapsed=%.2fs",
@@ -163,31 +158,31 @@ def _log_rfork_load_summary(session: RForkSession, source: str, started_at: floa
     )
 
 
-def _start_rfork_seed_service(
+def _schedule_seed_publication(
     session: RForkSession,
     model: Module,
-    processed_layout: bool,
     *,
     load_source: str,
-    structural_digest: str | None = None,
 ) -> bool:
     try:
-        result = session.start_seed_service(model, processed_layout, structural_digest=structural_digest)
+        if load_source == "fallback" and not session.register_local_weights_for_seed(model):
+            result = False
+        else:
+            result = session.schedule_seed_service()
     except Exception:
         logger.exception(
-            "RFork %s model loaded from %s, but seed service scheduling raised; inference can continue.",
+            "RFork %s model loaded from %s, but seed service startup raised; inference can continue.",
             _rfork_model_kind(session),
             load_source,
         )
         return False
-    started = bool(result)
-    if not started:
+    if not result:
         logger.warning(
-            "RFork %s model loaded from %s is ready, but seed service scheduling failed; inference can continue.",
+            "RFork %s model loaded from %s is ready, but seed service startup failed; inference can continue.",
             _rfork_model_kind(session),
             load_source,
         )
-    return started
+    return result
 
 
 def _is_mtp_hf_config(hf_config: object | None) -> bool:
@@ -551,6 +546,37 @@ def _reset_process_global_model_state(
             rope_ops_module._sin_cache = None
 
 
+def _cleanup_failed_rfork_load(
+    session: RForkSession | None,
+    vllm_config: VllmConfig,
+    model: Module | None,
+    model_init_started: bool,
+    snapshot: _RForkProcessGlobalModelState | None,
+) -> bool | None:
+    """Release the failed attempt before the default loader allocates another model."""
+    result = None
+    if session is not None:
+        for attempt in range(FALLBACK_CLEANUP_MAX_ATTEMPTS):
+            result = session.prepare_for_fallback()
+            if result:
+                break
+            if attempt + 1 < FALLBACK_CLEANUP_MAX_ATTEMPTS:
+                time.sleep(0.5)
+
+    if model_init_started:
+        _reset_process_global_model_state(vllm_config, model, snapshot)
+
+    if result is False:
+        raise RuntimeError(
+            "RFork fallback aborted because receiver memory cleanup failed; "
+            "tensor owners remain retained. Refusing to allocate a second model while old weights are pinned."
+        )
+
+    if model_init_started and model is not None:
+        release_local_weights(model)
+    return result
+
+
 def _iter_ascend_moe_quant_methods(model: Module) -> Iterator[Any]:
     """Yield each quant method owned by an Ascend MoE runner once."""
     from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
@@ -598,33 +624,15 @@ def _is_dynamic_eplb_enabled(vllm_config: VllmConfig) -> bool:
     return eplb_config.dynamic_eplb or bool(eplb_config.expert_map_record_path)
 
 
-@contextmanager
-def _rfork_skip_unquantized_moe_post_load_processing(model: Module):
-    """Suppress unquantized MoE post-load processing; dense layers still run theirs."""
-
-    from vllm_ascend.ops.fused_moe.routed_experts import AscendUnquantizedFusedMoEMethod
-
-    restored_methods: list[tuple[Any, object]] = []
-    for quant_method in _iter_ascend_moe_quant_methods(model):
-        if not isinstance(quant_method, AscendUnquantizedFusedMoEMethod):
-            continue
-
-        process_weights = getattr(quant_method, "process_weights_after_loading", None)
-        if process_weights is None:
-            continue
-
-        restored_methods.append((quant_method, process_weights))
-        quant_method.process_weights_after_loading = _noop_process_weights_after_loading  # type: ignore[method-assign]
-
-    try:
-        yield
-    finally:
-        for quant_method, process_weights in restored_methods:
-            quant_method.process_weights_after_loading = process_weights
-
-
-def _noop_process_weights_after_loading(*args: Any, **kwargs: Any) -> None:
-    pass
+def _rfork_bypass_reason(vllm_config: VllmConfig, model_config: ModelConfig) -> str | None:
+    reason = mutable_weights_bypass_reason(vllm_config, model_config)
+    if reason is not None:
+        return reason
+    if getattr(get_ascend_config().eplb_config, "expert_map_path", None) is not None:
+        return "static expert placement (expert_map_path)"
+    if _is_dynamic_eplb_enabled(vllm_config):
+        return "dynamic EPLB"
+    return None
 
 
 def _refresh_rfork_flatquant_state(model: Module) -> None:
@@ -637,6 +645,16 @@ def _refresh_rfork_flatquant_state(model: Module) -> None:
             raise ValueError("RFork FlatQuant runtime state requires a scalar clip_ratio tensor")
         # Refresh the host scalar once after transfer without rewriting device storage.
         module.aclnn_clip_ratio = clip_ratio.item()
+
+
+def _validate_rfork_shared_experts(model: Module) -> None:
+    from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
+
+    for module in model.modules():
+        if isinstance(module, AscendMoERunner):
+            shared_experts = module.ascend_shared_experts
+            if shared_experts is not None and shared_experts.multistream_overlap:
+                shared_experts.validate_consistency()
 
 
 @register_model_loader("rfork")
@@ -672,7 +690,8 @@ class RForkModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         raise NotImplementedError
 
-    def _ensure_rfork_session(self, vllm_config: VllmConfig, model_config: ModelConfig) -> RForkSession:
+    def _get_session(self, vllm_config: VllmConfig, model_config: ModelConfig) -> RForkSession:
+        """Return this model's session, creating it on first use."""
         session_attr = _get_rfork_session_attr(vllm_config, model_config)
         # Store runtime sessions on the process-lifetime LoadConfig shared by both loaders.
         identity = _build_rfork_identity(vllm_config, model_config, self.rfork_config)
@@ -710,24 +729,6 @@ class RForkModelLoader(BaseModelLoader):
             )
         return session
 
-    def _requires_processed_layout_transfer(self, model_config: ModelConfig) -> bool:
-        if getattr(model_config, "quantization", None) is not None:
-            return True
-
-        try:
-            weight_nz_mode = getattr(get_ascend_config(), "weight_nz_mode", 0)
-            if not isinstance(weight_nz_mode, bool) and int(weight_nz_mode) == 2:
-                return True
-        except (TypeError, ValueError, RuntimeError):
-            # AscendConfig may be unavailable during early or CPU-only loader inspection.
-            pass
-
-        try:
-            hardware_policy = getattr(get_current_hardware_profile(), "weight_layout_policy", None)
-            return getattr(hardware_policy, "name", str(hardware_policy).split(".")[-1]) == "FORCE_NZ"
-        except (AttributeError, RuntimeError):
-            return False
-
     def load_model(
         self,
         vllm_config: VllmConfig,
@@ -735,6 +736,7 @@ class RForkModelLoader(BaseModelLoader):
         prefix: str = "",
     ) -> Module | None:
         timing = StageTimer("setup")
+        session: RForkSession | None = None
         source = "error"
         outcome = "success"
         try:
@@ -744,20 +746,12 @@ class RForkModelLoader(BaseModelLoader):
             load_device = device_config.device if load_config.device is None else load_config.device
             target_device = torch.device(load_device)
 
-            with set_default_torch_dtype(model_config.dtype), timing.track_context_exit():
+            with set_default_torch_dtype(model_config.dtype), timing.track_context_exit(), ExitStack() as session_scope:
                 model_init_started = False
                 model: Module | None = None
-                session: RForkSession | None = None
                 model_state_snapshot: _RForkProcessGlobalModelState | None = None
                 model_state_prepared = True
-                processed_layout_transfer = self._requires_processed_layout_transfer(model_config)
-                bypass_reason = mutable_weights_bypass_reason(vllm_config, model_config)
-                if bypass_reason is None:
-                    eplb_config = get_ascend_config().eplb_config
-                    if getattr(eplb_config, "expert_map_path", None) is not None:
-                        bypass_reason = "static expert placement (expert_map_path)"
-                    elif _is_dynamic_eplb_enabled(vllm_config):
-                        bypass_reason = "dynamic EPLB"
+                bypass_reason = _rfork_bypass_reason(vllm_config, model_config)
 
                 if bypass_reason is not None:
                     logger.warning(
@@ -772,22 +766,17 @@ class RForkModelLoader(BaseModelLoader):
                 try:
                     # Keep session and TransferEngine initialization inside fallback-protected RFork loading.
                     with coordinator.stage("session setup"), timing.stage("session_setup"):
-                        session = self._ensure_rfork_session(vllm_config, model_config)
+                        session = self._get_session(vllm_config, model_config)
+                        session_scope.enter_context(session.loading())
                         model_state_snapshot = _snapshot_process_global_model_state(vllm_config)
                     with coordinator.stage("model construction", fallback=False), timing.stage("model_construction"):
                         model_init_started = True
-                        model_init_start_time = time.perf_counter()
                         with target_device:
                             model = initialize_model(
                                 vllm_config=vllm_config,
                                 model_config=model_config,
                                 prefix=prefix,
                             )
-                    logger.debug(
-                        "RFork %s model initialization took %.2f seconds",
-                        _rfork_model_kind(session),
-                        time.perf_counter() - model_init_start_time,
-                    )
 
                     with coordinator.stage("model state preparation"), timing.stage("model_state_preparation"):
                         model_state_prepared = False
@@ -797,74 +786,43 @@ class RForkModelLoader(BaseModelLoader):
                     with coordinator.stage("host weight loading"), timing.stage("host_weight_loading"):
                         load_local_weights(model)
 
-                    with coordinator.stage("transfer layout preparation"), timing.stage("transfer_layout_preparation"):
-                        if processed_layout_transfer:
-                            layout_start_time = time.perf_counter()
-                            logger.debug(
-                                "RFork %s model uses post-load tensor layout transfer.",
-                                _rfork_model_kind(session),
-                            )
+                    with coordinator.stage("layout preparation and weight transfer"):
+                        with timing.stage("transfer_layout_preparation"):
                             with _rfork_pre_transfer_weight_processing(model):
                                 process_weights_after_loading(model, model_config, target_device)
                             # Complete async NPU layout conversion before exposing buffers.
                             torch.npu.synchronize()
-                            logger.debug(
-                                "RFork %s model layout processing took %.2f seconds",
-                                _rfork_model_kind(session),
-                                time.perf_counter() - layout_start_time,
-                            )
 
-                    with coordinator.stage("weight transfer"), timing.stage("weight_transfer"):
-                        weight_load_start_time = time.perf_counter()
-                        timing.mark("destination_registration")
-                        if not session.register_destination(model, processed_layout_transfer):
-                            raise RuntimeError("destination registration failed.")
+                        with timing.stage("destination_registration"):
+                            if not session.register_receiver_weights(model):
+                                raise RuntimeError("receiver weight registration failed")
 
-                        timing.mark("seed_acquisition")
-                        acquire_seed_start_time = time.perf_counter()
-                        try:
-                            acquired_seed = session.acquire_seed()
-                        finally:
-                            logger.debug(
-                                "RFork %s seed acquisition took %.2f seconds",
-                                _rfork_model_kind(session),
-                                time.perf_counter() - acquire_seed_start_time,
-                            )
-                        if not acquired_seed:
-                            raise _RForkSeedUnavailable("planner returned no compatible seed")
+                        with timing.stage("seed_acquisition"):
+                            if not session.acquire_seed_lease():
+                                raise _RForkSeedUnavailable("planner did not provide a usable seed")
 
-                        timing.mark("weight_transfer")
-                        if not session.transfer_from_seed(model, processed_layout_transfer):
-                            raise RuntimeError("transfer failed.")
-                        logger.debug(
-                            "RFork %s model registration and transfer took %.2f seconds",
-                            _rfork_model_kind(session),
-                            time.perf_counter() - weight_load_start_time,
-                        )
+                        with timing.stage("weight_transfer"):
+                            if not session.read_weights_from_seed():
+                                raise RuntimeError("weight transfer failed")
 
                     with (
                         coordinator.stage("transferred model finalization"),
                         timing.stage("transferred_model_finalization"),
                     ):
-                        if processed_layout_transfer:
-                            _refresh_rfork_flatquant_state(model)
-                        else:
-                            with _rfork_skip_unquantized_moe_post_load_processing(model):
-                                process_weights_after_loading(model, model_config, target_device)
+                        _refresh_rfork_flatquant_state(model)
+                        _validate_rfork_shared_experts(model)
 
-                        # Advertise only after post-load and eval; the session owns failure cleanup.
+                        # Advertise only after finalization; the session owns failure cleanup.
                         model = model.eval()
-                        structural_digest = session.log_transferred_model_layout(model, processed_layout_transfer)
+                        session.validate_transferred_model_layout(model)
+                    source = "transfer"
                     timing.mark("seed_service")
-                    _start_rfork_seed_service(
+                    _schedule_seed_publication(
                         session,
                         model,
-                        processed_layout_transfer,
                         load_source="transfer",
-                        structural_digest=structural_digest,
                     )
                     timing.mark("coordination_and_overhead")
-                    source = "transfer"
                     _log_rfork_load_summary(session, "transfer", load_started_at)
                     return model
                 except _RForkLoadAborted:
@@ -888,39 +846,17 @@ class RForkModelLoader(BaseModelLoader):
                         # Partial host allocations cannot be closed without a model.
                         raise RuntimeError(
                             "RFork cannot safely retry failed model construction with Engram CPU offload; "
-                            "partial host allocations may remain. Fix the initialization error and restart the worker."
+                            "partial host allocations may remain. Fix the initialization error "
+                            "and restart the worker."
                         ) from e
                     fallback_source = source = "fallback"
                     logger.warning("RFork transfer failed: %s, clean up and fall back to default loader", e)
 
                 with coordinator.stage("fallback cleanup", fallback=False), timing.stage("fallback_cleanup"):
-                    cleanup_result: RForkFallbackCleanupResult | None = None
-                    if session is not None:
-                        for attempt in range(FALLBACK_CLEANUP_MAX_ATTEMPTS):
-                            cleanup_result = session.prepare_for_fallback()
-                            if cleanup_result.can_schedule_seed:
-                                break
-                            if attempt + 1 < FALLBACK_CLEANUP_MAX_ATTEMPTS:
-                                time.sleep(0.5)
-
+                    cleanup_result = _cleanup_failed_rfork_load(
+                        session, vllm_config, model, model_init_started, model_state_snapshot
+                    )
                     if model_init_started:
-                        _reset_process_global_model_state(vllm_config, model, model_state_snapshot)
-
-                    if cleanup_result is not None and not cleanup_result.can_schedule_seed:
-                        if session is not None and session.state is RForkLifecycleState.FINALIZED:
-                            raise RuntimeError(
-                                "RFork session has been finalized; model loading cannot resume after shutdown."
-                            )
-                        raise RuntimeError(
-                            "RFork fallback aborted because seed service or registered memory cleanup failed; "
-                            "tensor owners remain retained. Refusing to allocate a second model "
-                            "while old weights are pinned."
-                        )
-
-                    if model_init_started:
-                        if model is not None:
-                            # Release host allocations before fallback allocates a second model.
-                            release_local_weights(model)
                         model = None
                         for _ in range(FALLBACK_MEMORY_RECLAIM_PASSES):
                             gc.collect()
@@ -929,22 +865,16 @@ class RForkModelLoader(BaseModelLoader):
                 with coordinator.stage("local model loading", fallback=False), timing.stage("local_model_loading"):
                     model = _load_with_default_loader(vllm_config, model_config, self.load_config, prefix)
 
-                # Advertise fallback only via an existing session; startup failure cleans its MR but keeps the model.
-                if (
-                    model_state_prepared
-                    and session is not None
-                    and cleanup_result is not None
-                    and cleanup_result.can_schedule_seed
-                ):
+                # Publish only through an existing session; failure keeps the loaded model.
+                if model_state_prepared and session is not None and cleanup_result is not None and cleanup_result:
                     timing.mark("seed_service")
                     record_loaded_local_weights(model)
-                    _start_rfork_seed_service(
+                    _schedule_seed_publication(
                         session,
                         model,
-                        processed_layout_transfer,
                         load_source="fallback",
                     )
-                    timing.mark("coordination_and_overhead")
+                timing.mark("coordination_and_overhead")
                 if session is not None:
                     _log_rfork_load_summary(session, fallback_source, load_started_at)
                 return model
@@ -953,8 +883,12 @@ class RForkModelLoader(BaseModelLoader):
             raise
         finally:
             total_s, stages_s = timing.finish()
+            identity = getattr(session, "identity", None)
             logger.info(
-                "RFork load timing: scope=load_model source=%s outcome=%s total_s=%.6f stages_s=%s",
+                "RFork load timing: scope=load_model model_kind=%s global_rank=%s "
+                "source=%s outcome=%s total_s=%.6f stages_s=%s",
+                _rfork_model_kind(session) if session is not None else "unknown",
+                getattr(identity, "global_rank", "unknown"),
                 source,
                 outcome,
                 total_s,

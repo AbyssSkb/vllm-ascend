@@ -5,6 +5,7 @@
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -46,8 +47,15 @@ def cluster(request, monkeypatch):
     monkeypatch.setattr(module, "_reset_process_global_model_state", lambda *a: None)
     monkeypatch.setattr(module, "_prepare_rfork_model_state", lambda *a: fail("prepare"))
     monkeypatch.setattr(module, "load_local_weights", lambda *a: fail("host_load"))
+    monkeypatch.setattr(module, "process_weights_after_loading", lambda *a: fail("layout"))
     monkeypatch.setattr(module, "record_loaded_local_weights", lambda *a: None)
     monkeypatch.setattr(module, "_refresh_rfork_flatquant_state", lambda *a: None)
+
+    def validate_shared(*args):
+        events.append((local.rank, "finalization"))
+        fail("shared_validation")
+
+    monkeypatch.setattr(module, "_validate_rfork_shared_experts", validate_shared)
     monkeypatch.setattr(module, "gc", SimpleNamespace(collect=lambda: None))
     monkeypatch.setattr(
         module.torch, "npu", SimpleNamespace(empty_cache=lambda: None, synchronize=lambda: None), raising=False
@@ -75,45 +83,46 @@ def cluster(request, monkeypatch):
             raise error
 
     class Session:
+        loading = staticmethod(nullcontext)
+
         def __init__(self, rank):
             self.identity = SimpleNamespace(tp_rank=rank % 2, is_draft_model=False)
 
-        def register_destination(self, *args):
+        def register_receiver_weights(self, *args):
             fail("register")
             return True
 
-        def acquire_seed(self):
+        def acquire_seed_lease(self):
             return (local.rank, "seed_miss") not in errors
 
-        def transfer_from_seed(self, *args):
+        def read_weights_from_seed(self, *args):
             fail("transfer")
             events.append((local.rank, "transfer"))
             return True
 
-        def log_transferred_model_layout(self, *args):
+        def validate_transferred_model_layout(self, *args):
             fail("finalize")
 
         def prepare_for_fallback(self):
             fail("cleanup")
-            return SimpleNamespace(can_schedule_seed=True)
+            return True
 
     monkeypatch.setattr(module, "initialize_model", initialize)
     monkeypatch.setattr(module, "release_local_weights", release)
     monkeypatch.setattr(module, "_load_with_default_loader", fallback)
-    monkeypatch.setattr(module, "_start_rfork_seed_service", lambda *a, **kw: events.append((local.rank, "publish")))
+    monkeypatch.setattr(module, "_schedule_seed_publication", lambda *a, **kw: events.append((local.rank, "publish")))
 
     def run():
         def worker(rank):
             local.rank = rank
             loader = object.__new__(module.RForkModelLoader)
             loader.load_config = SimpleNamespace(device=None)
-            loader._requires_processed_layout_transfer = lambda mc: True
 
             def session(*args):
                 fail("session")
                 return Session(rank)
 
-            loader._ensure_rfork_session = session
+            loader._get_session = session
             config = SimpleNamespace(
                 device_config=SimpleNamespace(device="cpu"), engram_config=SimpleNamespace(cpu_offload=True)
             )
@@ -130,13 +139,17 @@ def cluster(request, monkeypatch):
     return SimpleNamespace(run=run, errors=errors, events=events)
 
 
-@pytest.mark.parametrize("stage", ["prepare", "host_load", "seed_miss", "register", "transfer", "finalize"])
+@pytest.mark.parametrize(
+    "stage", ["prepare", "host_load", "layout", "seed_miss", "register", "transfer", "shared_validation", "finalize"]
+)
 def test_one_rank_failure_reconstructs_all_ranks_after_cleanup(cluster, stage):
     cluster.errors[2, stage] = RuntimeError("injected failure")
     results = cluster.run()
     assert all(isinstance(result, torch.nn.Module) for result in results), results
     assert sum(event == "fallback" for _, event in cluster.events) == 4
     assert sum(event == "publish" for _, event in cluster.events) == (3 if stage == "prepare" else 4)
+    if stage in ("layout", "seed_miss", "register", "transfer"):
+        assert not any(event == "finalization" for _, event in cluster.events)
     first_publish = next(i for i, (_, event) in enumerate(cluster.events) if event == "publish")
     assert all(event != "transfer" for _, event in cluster.events[first_publish:])
 

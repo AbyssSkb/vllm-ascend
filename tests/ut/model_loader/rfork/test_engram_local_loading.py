@@ -260,9 +260,8 @@ def test_shared_load_synchronizes_success_and_failure(
 
 
 @pytest.mark.parametrize("entrypoint", ["rfork", "default"])
-@pytest.mark.parametrize("processed", [False, True])
 def test_host_table_is_ready_but_only_device_weight_is_registered(
-    tensor_runtime, local_weights, embedding_runtime, tmp_path, monkeypatch, entrypoint, processed
+    tensor_runtime, local_weights, embedding_runtime, tmp_path, monkeypatch, entrypoint
 ):
     table, _ = make_table(embedding_runtime, tmp_path)
     model = torch.nn.Module()
@@ -289,21 +288,20 @@ def test_host_table_is_ready_but_only_device_weight_is_registered(
         SimpleNamespace(memory=SimpleNamespace(memory_snapshot=lambda: [{"blocks": [block]}])),
         raising=False,
     )
-    assert not backend.register_memory_region(model, processed)
+    assert not backend.register_memory_region(model)
     backend.transfer_engine.batch_register_memory_ex.assert_not_called()
     if entrypoint == "rfork":
         local_weights.load_local_weights(model)
     else:
         table._weight_loader(table.weight, None)
         local_weights.record_loaded_local_weights(model)
-    assert backend.register_memory_region(model, processed)
+    assert backend.register_memory_region(model)
     assert list(backend.weight_manifest) == ["device_weight"]
     backend.transfer_engine.batch_register_memory_ex.assert_called_once()
 
 
-@pytest.mark.parametrize("processed", [False, True])
 @pytest.mark.parametrize("outcome", ["transfer", "seed_miss", "local_failure", "release_failure", "init_failure"])
-def test_loader_loads_local_state_before_registration(rfork_helpers, monkeypatch, processed, outcome):
+def test_loader_loads_local_state_before_registration(rfork_helpers, monkeypatch, outcome):
     """Check load/release ordering and prevent unsafe retries after partial construction."""
     runtime = rfork_helpers.loader
     model = torch.nn.Module()
@@ -337,16 +335,16 @@ def test_loader_loads_local_state_before_registration(rfork_helpers, monkeypatch
         return result
 
     session = SimpleNamespace(
-        register_destination=lambda *args: record("register", True),
-        acquire_seed=lambda: outcome not in ("seed_miss", "release_failure"),
-        transfer_from_seed=lambda *args: True,
-        log_transferred_model_layout=lambda *args: None,
-        prepare_for_fallback=lambda: SimpleNamespace(can_schedule_seed=True),
+        loading=nullcontext,
+        register_receiver_weights=lambda *args: record("register", True),
+        acquire_seed_lease=lambda: outcome not in ("seed_miss", "release_failure"),
+        read_weights_from_seed=lambda *args: True,
+        validate_transferred_model_layout=lambda *args: None,
+        prepare_for_fallback=lambda: True,
     )
     loader = object.__new__(runtime.RForkModelLoader)
     loader.load_config = SimpleNamespace(device=None)
-    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda *args: session)
-    monkeypatch.setattr(loader, "_requires_processed_layout_transfer", lambda *args: processed)
+    monkeypatch.setattr(loader, "_get_session", lambda *args: session)
     monkeypatch.setattr(runtime, "mutable_weights_bypass_reason", lambda *args: None)
     monkeypatch.setattr(runtime, "get_ascend_config", lambda: SimpleNamespace(eplb_config=SimpleNamespace()))
     monkeypatch.setattr(runtime, "_is_dynamic_eplb_enabled", lambda *args: False)
@@ -364,8 +362,7 @@ def test_loader_loads_local_state_before_registration(rfork_helpers, monkeypatch
         return model
 
     monkeypatch.setattr(runtime, "initialize_model", initialize_model)
-    monkeypatch.setattr(runtime, "_rfork_skip_unquantized_moe_post_load_processing", lambda *args: nullcontext())
-    monkeypatch.setattr(runtime, "_start_rfork_seed_service", lambda *args, **kwargs: events.append("seed"))
+    monkeypatch.setattr(runtime, "_schedule_seed_publication", lambda *args, **kwargs: events.append("seed"))
     monkeypatch.setattr(
         runtime.torch, "npu", SimpleNamespace(synchronize=lambda: None, empty_cache=lambda: None), raising=False
     )

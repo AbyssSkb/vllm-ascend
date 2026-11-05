@@ -54,20 +54,13 @@ def runtime(monkeypatch, local_weights, ascend_envs):
         RForkTransferBackend=lambda **kwargs: Mock(registered_structural_digest="registered-digest"),
     )
 
-    class StartupError(RuntimeError):
-        def __init__(self, message, *, handle=None):
-            super().__init__(message)
-            self.handle = handle
-
     stub(
         f"{prefix}.seed_server",
         RForkSeedServerHandle=Mock,
-        RForkSeedServerStartupError=StartupError,
-        start_rfork_server=Mock(),
+        create_rfork_server=Mock(),
     )
     types = load("types")
     config = load("config")
-    load("manifest")
     load("timing")
     load("tensor_layout")
     load("seed_client")
@@ -109,10 +102,8 @@ def tensor_runtime(monkeypatch, local_weights):
     class _SeedTransferInfo:
         session_id: str
         weights: dict
-        formats: dict | None = None
 
     _stub(monkeypatch, "vllm_ascend.model_loader.rfork.types", SeedTransferInfo=_SeedTransferInfo)
-    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.manifest", "manifest.py")
     _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.timing", "timing.py")
     tensor_layout = _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.tensor_layout", "tensor_layout.py")
     transfer_backend = _load_module(
@@ -207,10 +198,8 @@ def rfork_helpers(monkeypatch, local_weights):
     types_module = _load_module(monkeypatch, "rfork_restored_lifecycle_types", "types.py")
     install(
         "vllm_ascend.model_loader.rfork.types",
-        RForkFallbackCleanupResult=types_module.RForkFallbackCleanupResult,
         RForkIdentity=types_module.RForkIdentity,
         RForkLifecycleState=types_module.RForkLifecycleState,
-        RForkSeedServiceStartResult=types_module.RForkSeedServiceStartResult,
     )
 
     package("vllm_ascend.eplb")

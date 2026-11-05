@@ -31,11 +31,7 @@ from vllm_ascend.model_loader.rfork.rfork_loader import (
     _make_fallback_load_config,
     _reset_process_global_model_state,
     _rfork_pre_transfer_weight_processing,
-    _rfork_skip_unquantized_moe_post_load_processing,
-    _start_rfork_seed_service,
-)
-from vllm_ascend.model_loader.rfork.types import (
-    RForkFallbackCleanupResult,
+    _schedule_seed_publication,
 )
 
 
@@ -240,7 +236,7 @@ def test_rfork_session_receives_parallel_ranks(monkeypatch):
     monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.get_tensor_model_parallel_rank", lambda: 5)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 11)
 
-    session = loader._ensure_rfork_session(vllm_config, model_config)
+    session = loader._get_session(vllm_config, model_config)
 
     assert session is expected_session
     assert captured["identity"].tp_rank == 5
@@ -249,7 +245,7 @@ def test_rfork_session_receives_parallel_ranks(monkeypatch):
     assert captured["identity"].global_rank == 11
 
 
-def test_rfork_draft_load_registers_and_transfers_its_own_weights(monkeypatch):
+def test_rfork_draft_load_registers_draft_model(monkeypatch):
     import vllm.model_executor.model_loader as model_loader
 
     load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
@@ -260,34 +256,36 @@ def test_rfork_draft_load_registers_and_transfers_its_own_weights(monkeypatch):
         hf_config=SimpleNamespace(model_type="qwen3_5_mtp"),
     )
     vllm_config = _vllm_config(model_config=draft_model_config)
+    registered_models = []
     events = []
 
     class _DraftSession:
-        def register_destination(self, model, processed_layout):
-            events.append("register")
+        loading = staticmethod(nullcontext)
+
+        def register_receiver_weights(self, model):
+            registered_models.append(model)
             return True
 
-        def acquire_seed(self):
+        def acquire_seed_lease(self):
             events.append("seed")
             return True
 
-        def transfer_from_seed(self, model, processed_layout):
+        def read_weights_from_seed(self):
             events.append("transfer")
             return True
 
-        def log_transferred_model_layout(self, model, processed_layout):
+        def validate_transferred_model_layout(self, model):
             events.append("layout_summary")
 
-        def start_seed_service(self, model, processed_layout, *, structural_digest=None):
-            events.append("start_seed_service")
+        def schedule_seed_service(self):
+            events.append("schedule_seed_service")
             return True
 
         def prepare_for_fallback(self):
             return True
 
     draft_session = _DraftSession()
-    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: draft_session)
-    monkeypatch.setattr(loader, "_requires_processed_layout_transfer", lambda mc: False)
+    monkeypatch.setattr(loader, "_get_session", lambda vc, mc: draft_session)
 
     class _Model(torch.nn.Module):
         def eval(self):
@@ -312,24 +310,24 @@ def test_rfork_draft_load_registers_and_transfers_its_own_weights(monkeypatch):
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
-        "vllm_ascend.model_loader.rfork.rfork_loader._rfork_skip_unquantized_moe_post_load_processing",
+        "vllm_ascend.model_loader.rfork.rfork_loader._rfork_pre_transfer_weight_processing",
         lambda model: nullcontext(),
     )
 
     model = loader.load_model(vllm_config=vllm_config, model_config=draft_model_config)
 
     assert model is expected_model
-    assert events == ["register", "seed", "transfer", "layout_summary", "start_seed_service"]
+    assert registered_models == [expected_model]
 
 
-@pytest.mark.parametrize("processed_layout", [False, True])
-def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layout):
+@pytest.mark.parametrize("quantization", [None, "ascend"])
+def test_rfork_acquires_seed_after_model_preparation(monkeypatch, quantization):
     load_config = DummyLoadConfig({"model_url": "model", "model_deploy_strategy_name": "strategy"})
     loader = RForkModelLoader(load_config)
     model_config = SimpleNamespace(
         dtype=torch.float32,
         model="/models/test",
-        quantization="ascend" if processed_layout else None,
+        quantization=quantization,
     )
     vllm_config = _vllm_config(model_config=model_config)
     events = []
@@ -340,30 +338,30 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
     model = _Model()
 
     class _Session:
-        def register_destination(self, model, processed_layout):
+        loading = staticmethod(nullcontext)
+
+        def register_receiver_weights(self, model):
             return True
 
-        def acquire_seed(self):
+        def acquire_seed_lease(self):
             events.append("acquire")
             return True
 
-        def transfer_from_seed(self, model, processed_layout):
+        def read_weights_from_seed(self):
             events.append("transfer")
             return True
 
-        def log_transferred_model_layout(self, model, processed_layout):
+        def validate_transferred_model_layout(self, model):
             assert not model.training
             events.append("layout_summary")
             return "final-digest"
 
-        def start_seed_service(self, model, processed_layout, *, structural_digest=None):
-            assert structural_digest == "final-digest"
-            events.append("start_seed_service")
+        def schedule_seed_service(self):
+            events.append("schedule_seed_service")
             return True
 
     session = _Session()
-    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: session)
-    monkeypatch.setattr(loader, "_requires_processed_layout_transfer", lambda mc: processed_layout)
+    monkeypatch.setattr(loader, "_get_session", lambda vc, mc: session)
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
         lambda: SimpleNamespace(eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None)),
@@ -376,10 +374,10 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
     monkeypatch.setattr("vllm_ascend.model_loader.rfork.rfork_loader.initialize_model", initialize_model)
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.process_weights_after_loading",
-        lambda *args, **kwargs: events.append("layout" if processed_layout else "post_load"),
+        lambda *args, **kwargs: events.append("layout"),
     )
     monkeypatch.setattr(
-        "vllm_ascend.model_loader.rfork.rfork_loader._rfork_skip_unquantized_moe_post_load_processing",
+        "vllm_ascend.model_loader.rfork.rfork_loader._rfork_pre_transfer_weight_processing",
         lambda model: nullcontext(),
     )
     monkeypatch.setattr(
@@ -391,10 +389,7 @@ def test_rfork_acquires_seed_after_model_preparation(monkeypatch, processed_layo
 
     assert loader.load_model(vllm_config=vllm_config, model_config=model_config) is model
 
-    if processed_layout:
-        assert events[:6] == ["initialize", "layout", "synchronize", "acquire", "transfer", "layout_summary"]
-    else:
-        assert events[:5] == ["initialize", "acquire", "transfer", "post_load", "layout_summary"]
+    assert events[:6] == ["initialize", "layout", "synchronize", "acquire", "transfer", "layout_summary"]
 
 
 @pytest.mark.parametrize("failure_stage", ["initialize", "layout"])
@@ -419,22 +414,26 @@ def test_rfork_model_preparation_failure_does_not_acquire_seed(monkeypatch, fail
     )
 
     class _Session:
-        def register_destination(self, model, processed_layout):
+        loading = staticmethod(nullcontext)
+
+        def register_receiver_weights(self, model):
             return True
 
-        def acquire_seed(self):
+        def acquire_seed_lease(self):
             acquire_calls.append(True)
             raise AssertionError("seed acquisition must happen after model preparation")
 
         def prepare_for_fallback(self):
-            return RForkFallbackCleanupResult(True, True, True)
+            return True
 
-        def start_seed_service(self, model, processed_layout, *, structural_digest=None):
+        def register_local_weights_for_seed(self, model):
+            return True
+
+        def schedule_seed_service(self):
             return True
 
     session = _Session()
-    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: session)
-    monkeypatch.setattr(loader, "_requires_processed_layout_transfer", lambda mc: failure_stage == "layout")
+    monkeypatch.setattr(loader, "_get_session", lambda vc, mc: session)
     monkeypatch.setattr(model_loader, "get_model", lambda **kwargs: fallback_model)
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
@@ -464,31 +463,6 @@ def test_rfork_model_preparation_failure_does_not_acquire_seed(monkeypatch, fail
 
     assert loader.load_model(vllm_config=vllm_config, model_config=model_config) is fallback_model
     assert acquire_calls == []
-
-
-@pytest.mark.parametrize(
-    ("quantization", "weight_nz_mode", "hardware_policy", "expected"),
-    [
-        ("ascend", 0, "CONFIGURABLE", True),
-        (None, 2, "CONFIGURABLE", True),
-        (None, 0, "FORCE_NZ", True),
-        (None, 0, "CONFIGURABLE", False),
-    ],
-)
-def test_rfork_processed_layout_covers_quantization_and_nz_modes(
-    monkeypatch, quantization, weight_nz_mode, hardware_policy, expected
-):
-    monkeypatch.setattr(
-        "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
-        lambda: SimpleNamespace(weight_nz_mode=weight_nz_mode),
-    )
-    monkeypatch.setattr(
-        "vllm_ascend.model_loader.rfork.rfork_loader.get_current_hardware_profile",
-        lambda: SimpleNamespace(weight_layout_policy=SimpleNamespace(name=hardware_policy)),
-    )
-    loader = RForkModelLoader(DummyLoadConfig({}))
-
-    assert loader._requires_processed_layout_transfer(SimpleNamespace(quantization=quantization)) is expected
 
 
 @pytest.mark.parametrize(
@@ -618,7 +592,7 @@ def test_rfork_dynamic_eplb_uses_default_loader(monkeypatch):
         captured.update(kwargs)
         return expected_model
 
-    monkeypatch.setattr(loader, "_ensure_rfork_session", fail_if_rfork_session_is_created)
+    monkeypatch.setattr(loader, "_get_session", fail_if_rfork_session_is_created)
     monkeypatch.setattr(model_loader, "get_model", fake_get_model)
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
@@ -649,7 +623,7 @@ def test_rfork_session_construction_failure_falls_back_without_starting_seed(mon
     def fail_session(*args, **kwargs):
         raise RuntimeError("TransferEngine unavailable")
 
-    monkeypatch.setattr(loader, "_ensure_rfork_session", fail_session)
+    monkeypatch.setattr(loader, "_get_session", fail_session)
     monkeypatch.setattr(model_loader, "get_model", lambda **kwargs: expected_model)
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
@@ -657,7 +631,7 @@ def test_rfork_session_construction_failure_falls_back_without_starting_seed(mon
     )
 
     class _UnexpectedSession:
-        def start_seed_service(self, *args, **kwargs):
+        def schedule_seed_service(self, *args, **kwargs):
             start_calls.append((args, kwargs))
 
     monkeypatch.setattr(
@@ -685,32 +659,33 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
     model = _Model()
 
     class _Session:
+        loading = staticmethod(nullcontext)
+
         identity = SimpleNamespace(is_draft_model=False)
 
-        def register_destination(self, model, processed_layout):
+        def register_receiver_weights(self, model):
             return True
 
-        def acquire_seed(self):
+        def acquire_seed_lease(self):
             events.append("seed")
             return True
 
-        def transfer_from_seed(self, model, processed_layout):
+        def read_weights_from_seed(self):
             events.append("transfer")
             return True
 
-        def log_transferred_model_layout(self, model, processed_layout):
+        def validate_transferred_model_layout(self, model):
             events.append("layout_summary")
 
-        def start_seed_service(self, model, processed_layout, *, structural_digest=None):
-            events.append("start_seed_service")
+        def schedule_seed_service(self):
+            events.append("schedule_seed_service")
             return False
 
         def prepare_for_fallback(self):
             return True
 
     session = _Session()
-    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: session)
-    monkeypatch.setattr(loader, "_requires_processed_layout_transfer", lambda mc: False)
+    monkeypatch.setattr(loader, "_get_session", lambda vc, mc: session)
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
         lambda: SimpleNamespace(eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None)),
@@ -724,7 +699,7 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
-        "vllm_ascend.model_loader.rfork.rfork_loader._rfork_skip_unquantized_moe_post_load_processing",
+        "vllm_ascend.model_loader.rfork.rfork_loader._rfork_pre_transfer_weight_processing",
         lambda model: nullcontext(),
     )
     monkeypatch.setattr(
@@ -735,8 +710,8 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
     result = loader.load_model(vllm_config=vllm_config, model_config=model_config)
 
     assert result is model
-    assert events.index("eval") < events.index("start_seed_service")
-    assert any("seed service scheduling failed" in args[0] for args in warnings)
+    assert events.index("eval") < events.index("schedule_seed_service")
+    assert any("seed service startup failed" in args[0] for args in warnings)
 
 
 def test_rfork_fallback_seed_is_deferred_when_only_lease_release_is_pending(monkeypatch):
@@ -751,24 +726,28 @@ def test_rfork_fallback_seed_is_deferred_when_only_lease_release_is_pending(monk
     seed_start_models = []
 
     class _Session:
-        def register_destination(self, model, processed_layout):
+        loading = staticmethod(nullcontext)
+
+        def register_receiver_weights(self, model):
             return True
 
-        def acquire_seed(self):
+        def acquire_seed_lease(self):
             return True
 
-        def transfer_from_seed(self, model, processed_layout):
+        def read_weights_from_seed(self):
             return False
 
         def prepare_for_fallback(self):
-            return RForkFallbackCleanupResult(service_stopped=True, lease_released=False, memory_reset=True)
+            return True
 
-        def start_seed_service(self, model, processed_layout, *, structural_digest=None):
+        def register_local_weights_for_seed(self, model):
             seed_start_models.append(model)
             return True
 
-    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: _Session())
-    monkeypatch.setattr(loader, "_requires_processed_layout_transfer", lambda mc: False)
+        def schedule_seed_service(self):
+            return True
+
+    monkeypatch.setattr(loader, "_get_session", lambda vc, mc: _Session())
     monkeypatch.setattr(model_loader, "get_model", lambda **kwargs: fallback_model)
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.initialize_model",
@@ -783,7 +762,7 @@ def test_rfork_fallback_seed_is_deferred_when_only_lease_release_is_pending(monk
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
-        "vllm_ascend.model_loader.rfork.rfork_loader._rfork_skip_unquantized_moe_post_load_processing",
+        "vllm_ascend.model_loader.rfork.rfork_loader._rfork_pre_transfer_weight_processing",
         lambda model: nullcontext(),
     )
 
@@ -795,9 +774,14 @@ def test_rfork_seed_start_exception_does_not_escape(monkeypatch):
     exceptions = []
 
     class _Session:
+        loading = staticmethod(nullcontext)
+
         identity = SimpleNamespace(is_draft_model=False)
 
-        def start_seed_service(self, *args, **kwargs):
+        def register_local_weights_for_seed(self, *args, **kwargs):
+            return True
+
+        def schedule_seed_service(self, *args, **kwargs):
             raise RuntimeError("seed server failed")
 
     monkeypatch.setattr(
@@ -805,13 +789,12 @@ def test_rfork_seed_start_exception_does_not_escape(monkeypatch):
         lambda *args, **kwargs: exceptions.append(args),
     )
 
-    assert not _start_rfork_seed_service(
+    assert not _schedule_seed_publication(
         _Session(),  # type: ignore[arg-type]
         object(),
-        False,
         load_source="fallback",
     )
-    assert any("seed service scheduling raised" in args[0] for args in exceptions)
+    assert any("seed service startup raised" in args[0] for args in exceptions)
 
 
 def test_rfork_fallback_clears_only_failed_model_state_before_reinit(monkeypatch):
@@ -861,14 +844,16 @@ def test_rfork_fallback_clears_only_failed_model_state_before_reinit(monkeypatch
         return expected_model
 
     rfork_session = SimpleNamespace(
-        register_destination=lambda model, processed_layout: True,
-        acquire_seed=lambda: True,
-        transfer_from_seed=lambda model, processed_layout: False,
-        prepare_for_fallback=lambda: RForkFallbackCleanupResult(True, True, True),
-        start_seed_service=lambda model, processed_layout, **kwargs: True,
+        loading=nullcontext,
+        register_receiver_weights=lambda model: True,
+        acquire_seed_lease=lambda: True,
+        read_weights_from_seed=lambda: False,
+        prepare_for_fallback=lambda: True,
+        register_local_weights_for_seed=lambda model: True,
+        schedule_seed_service=lambda: True,
     )
 
-    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: rfork_session)
+    monkeypatch.setattr(loader, "_get_session", lambda vc, mc: rfork_session)
     monkeypatch.setattr(model_loader, "get_model", fake_get_model)
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
@@ -945,13 +930,15 @@ def test_rfork_seed_miss_fallback_preserves_existing_process_global_state(monkey
         return expected_model
 
     rfork_session = SimpleNamespace(
-        register_destination=lambda model, processed_layout: True,
-        acquire_seed=lambda: False,
-        prepare_for_fallback=lambda: RForkFallbackCleanupResult(True, True, True),
-        start_seed_service=lambda model, processed_layout, **kwargs: True,
+        loading=nullcontext,
+        register_receiver_weights=lambda model: True,
+        acquire_seed_lease=lambda: False,
+        prepare_for_fallback=lambda: True,
+        register_local_weights_for_seed=lambda model: True,
+        schedule_seed_service=lambda: True,
     )
 
-    monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: rfork_session)
+    monkeypatch.setattr(loader, "_get_session", lambda vc, mc: rfork_session)
     monkeypatch.setattr(model_loader, "get_model", fake_get_model)
     monkeypatch.setattr(
         "vllm_ascend.model_loader.rfork.rfork_loader.get_ascend_config",
@@ -1021,59 +1008,3 @@ def test_rfork_pre_transfer_weight_processing_unwraps_and_restores_quant_methods
         assert quant_method.process_weights_after_loading is original_process_weights
         raise RuntimeError("boom")
     assert quant_method.process_weights_after_loading is wrapped_process_weights
-
-
-def test_rfork_skips_only_unquantized_moe_post_load_processing(monkeypatch):
-    import vllm_ascend.ops.fused_moe.fused_moe as fused_moe_module
-    import vllm_ascend.ops.fused_moe.routed_experts as routed_experts_module
-
-    class _FakeAscendUnquantizedFusedMoEMethod:
-        def __init__(self, process_weights_after_loading):
-            self.process_weights_after_loading = process_weights_after_loading
-
-    class _FakeAscendMoERunner:
-        def __init__(self, quant_method):
-            self._quant_method = quant_method
-
-    calls = []
-
-    def unquantized_process(*args, **kwargs):
-        calls.append("unquantized")
-
-    def quantized_process(*args, **kwargs):
-        calls.append("quantized")
-
-    unquantized_method = _FakeAscendUnquantizedFusedMoEMethod(unquantized_process)
-    quantized_method = SimpleNamespace(process_weights_after_loading=quantized_process)
-    unquantized_layer = _FakeAscendMoERunner(unquantized_method)
-    quantized_layer = _FakeAscendMoERunner(quantized_method)
-    duplicate_unquantized_layer = _FakeAscendMoERunner(unquantized_method)
-
-    class _FakeModule:
-        def modules(self):
-            return iter(
-                [
-                    self,
-                    unquantized_layer,
-                    quantized_layer,
-                    duplicate_unquantized_layer,
-                ]
-            )
-
-    monkeypatch.setattr(
-        routed_experts_module,
-        "AscendUnquantizedFusedMoEMethod",
-        _FakeAscendUnquantizedFusedMoEMethod,
-    )
-    monkeypatch.setattr(fused_moe_module, "AscendMoERunner", _FakeAscendMoERunner)
-
-    with _rfork_skip_unquantized_moe_post_load_processing(_FakeModule()):
-        assert unquantized_method.process_weights_after_loading() is None
-        quantized_method.process_weights_after_loading()
-        assert calls == ["quantized"]
-    assert unquantized_method.process_weights_after_loading is unquantized_process
-    assert quantized_method.process_weights_after_loading is quantized_process
-
-    with pytest.raises(RuntimeError, match="boom"), _rfork_skip_unquantized_moe_post_load_processing(_FakeModule()):
-        raise RuntimeError("boom")
-    assert unquantized_method.process_weights_after_loading is unquantized_process
