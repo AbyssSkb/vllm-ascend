@@ -56,6 +56,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots i
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
     prepare_sparse_kv_offload_mtp_dummy_metadata,
 )
+from vllm_ascend.model_loader.rfork import managed_weights
 from vllm_ascend.models.deepseek_v4.dspark import DSparkDeepseekV4ForCausalLM
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
@@ -354,6 +355,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         draft_vllm_config = self._create_draft_vllm_config()
         draft_load_config = self.speculative_config.draft_load_config
+        draft_model_config = self.speculative_config.draft_model_config
+        if (
+            managed_weights.enabled()
+            and self.vllm_config.load_config.load_format == "rfork"
+            and draft_load_config is not None
+            and draft_load_config.load_format != "rfork"
+        ):
+            draft_vllm_config, draft_model_config = managed_weights.mounted_configs(
+                draft_vllm_config, draft_model_config
+            )
         logger.info(
             "[spec_decode/base] Loading draft model: method=%s, load_format=%s, model=%s",
             self.method,
@@ -363,8 +374,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         with set_model_tag("eagle_head"):
             model = get_model(
                 vllm_config=draft_vllm_config,
-                model_config=self.speculative_config.draft_model_config,
-                load_config=self.speculative_config.draft_load_config,
+                model_config=draft_model_config,
+                load_config=draft_load_config,
             )
             self._maybe_remove_d2t(model)
 

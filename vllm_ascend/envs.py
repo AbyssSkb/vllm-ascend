@@ -91,6 +91,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Use the external model manager for RFork weight files (0 or 1, default 0; not sensitive).
+    "VLLM_ASCEND_ASYNC_MODEL_MOUNT": lambda: bool(int(os.getenv("VLLM_ASCEND_ASYNC_MODEL_MOUNT", "0"))),
 }
 
 # end-env-vars-definition

@@ -4,6 +4,7 @@ from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
 
+from vllm_ascend.model_loader.rfork import managed_weights
 from vllm_ascend.models.llama_eagle3 import load_quarot_target_layer
 from vllm_ascend.utils import (
     get_rotation_matrix,
@@ -41,8 +42,19 @@ def process_weight(linear_weight: torch.Tensor, rotation_weight: torch.Tensor):
 @torch.no_grad()
 def align_draft_weights(model, projection, vllm_config):
     """Align draft inputs with the rotated target without modifying shared weights."""
+    mounted = False
+
+    def resolve_checkpoint():
+        nonlocal vllm_config, mounted
+        if not mounted and managed_weights.enabled() and vllm_config.load_config.load_format == "rfork":
+            vllm_config, _ = managed_weights.mounted_configs(vllm_config, vllm_config.model_config)
+            mounted = True
+
     rotation_path = get_rotation_path(vllm_config)
     if rotation_path is not None:
+        if not rotation_path.is_file():
+            resolve_checkpoint()
+            rotation_path = get_rotation_path(vllm_config)
         rotation = get_rotation_matrix(rotation_path).cpu()
         weight = projection.weight
         weight.copy_(process_weight(weight.cpu(), rotation).to(weight.device))
@@ -65,6 +77,7 @@ def align_draft_weights(model, projection, vllm_config):
             # The target lm_head lives on the last PP stage and can still
             # be aliased; only the embedding needs its own copy.
             continue
+        resolve_checkpoint()
         with torch.device(weight.device):
             layer = layer_cls(target_config.vocab_size, target_config.hidden_size, params_dtype=weight.dtype)
         load_quarot_target_layer(layer, vllm_config.model_config.model, weight_names, rotation, f"draft {name}.weight")

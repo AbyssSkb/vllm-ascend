@@ -63,6 +63,29 @@ RFork validates this configuration at startup. An invalid field value, or a miss
 default loader; fallback covers runtime failures only, such as a seed miss or a transfer error. Unknown
 `model_loader_extra_config` keys are ignored with a warning, so check the spelling of every field.
 
+### Externally Managed Model Weights
+
+Set `VLLM_ASCEND_ASYNC_MODEL_MOUNT=1` to use a model directory provided by an external manager.
+The setting defaults to `0`. The manager downloads the weights independently and must expose
+`model_manager.apis.get_model_path_from_manager(with_weights=True)`, which blocks until the complete
+checkpoint directory is available and returns its local path.
+
+Pass an already available bootstrap directory to `vllm serve`. It must contain the configuration,
+tokenizer resources, and any other files needed to start the engine. The bootstrap and managed
+directories must describe the same checkpoint. Keep the bootstrap directory available for the
+process lifetime, because tokenizer configuration continues to reference it. The manager interface
+selects one checkpoint, so it cannot provide an independent draft checkpoint.
+
+RFork can initialize and load weights from a compatible seed while the external manager prepares
+the directory. A successful transfer for a model without file-dependent initialization does not
+wait for the complete directory. DeepSeek MTP or Engram preparation may require checkpoint files;
+RFork waits for the manager when those files are needed. Local loading after a seed miss or transfer
+failure also waits for the complete directory, after RFork cleanup succeeds.
+Different ranks may load their own shards from different compatible sources. The deployment must
+ensure that the managed checkpoint and RFork seeds contain the same weights.
+With pipeline parallelism and an Engram configuration, managed RFork draft loading currently
+supports DeepSeek V4 MTP; other draft architectures are rejected because their coordination is not verified.
+
 ## Example Commands & Placeholders
 
 > Replace parts in `<...>` before running.

@@ -44,6 +44,7 @@ from vllm.model_executor.model_loader.utils import (
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.model_loader.rfork import managed_weights
 from vllm_ascend.model_loader.rfork.config import (
     RForkConfig,
     RForkConfigurationError,
@@ -81,9 +82,9 @@ class _RForkLoadAborted(RuntimeError):
 class _RForkLoadCoordinator:
     """Keep Engram loader branches aligned across one deployment."""
 
-    def __init__(self, vllm_config: VllmConfig):
+    def __init__(self, vllm_config: VllmConfig, *, skip_engram: bool = False):
         self.group: torch.distributed.ProcessGroup | None = None
-        if getattr(vllm_config, "engram_config", None) is None:
+        if skip_engram or getattr(vllm_config, "engram_config", None) is None:
             return
         from vllm.distributed.parallel_state import get_world_group
 
@@ -222,6 +223,16 @@ def _is_draft_model(vllm_config: VllmConfig, model_config: ModelConfig | None = 
     )
 
 
+def _is_deepseek_v4_mtp(model_config: ModelConfig) -> bool:
+    for name in ("hf_config", "hf_text_config"):
+        architectures = getattr(getattr(model_config, name, None), "architectures", ()) or ()
+        if isinstance(architectures, str):
+            architectures = (architectures,)
+        if "DeepSeekV4MTPModel" in architectures:
+            return True
+    return False
+
+
 def _get_rfork_session_attr(vllm_config: VllmConfig, model_config: ModelConfig) -> str:
     return "rfork_draft_session" if _is_draft_model(vllm_config, model_config) else "rfork_session"
 
@@ -351,18 +362,37 @@ def _get_checkpoint_weight_names(model: Module, model_config: ModelConfig, load_
     return weight_names
 
 
-def _prepare_rfork_model_state(model: Module, model_config: ModelConfig, load_config: LoadConfig) -> None:
+def _prepare_rfork_model_state(
+    model: Module, model_config: ModelConfig, load_config: LoadConfig, checkpoint_names: set[str] | None = None
+) -> None:
     from vllm_ascend.models.deepseek_mtp import AscendDeepSeekMTP
 
     if not isinstance(model, AscendDeepSeekMTP):
         return
 
-    names = list(_get_checkpoint_weight_names(model, model_config, load_config))
+    names = list(
+        checkpoint_names
+        if checkpoint_names is not None
+        else _get_checkpoint_weight_names(model, model_config, load_config)
+    )
     if model.quant_config is not None and (mapper := model.quant_config.get_cache_scale_mapper()):
         names = mapper.apply_list(names)
     # The model's rot mapper cannot change head ownership, so only the cache mapper is needed here.
     local_weight_names = {name for name, _ in model.named_parameters()}
     model._maybe_set_own_lm_head(set(names) & local_weight_names)
+
+
+def _bootstrap_checkpoint_names(model: Module, model_config: ModelConfig) -> set[str] | None:
+    if getattr(model, "secondary_weights", ()) or getattr(model, "allow_patterns_overrides", None):
+        return None
+    index = os.path.join(model_config.model, "model.safetensors.index.json")
+    if not os.path.isfile(index):
+        return None
+    with open(index, encoding="utf-8") as stream:
+        weight_map = json.load(stream)["weight_map"]
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError("RFork model-state preparation received invalid checkpoint metadata")
+    return set(weight_map)
 
 
 def _load_with_default_loader(
@@ -740,6 +770,16 @@ class RForkModelLoader(BaseModelLoader):
         source = "error"
         outcome = "success"
         try:
+            skip_engram = managed_weights.enabled() and _is_deepseek_v4_mtp(model_config)
+            parallel = getattr(vllm_config, "parallel_config", None)
+            if (
+                managed_weights.enabled()
+                and not skip_engram
+                and _is_draft_model(vllm_config, model_config)
+                and getattr(vllm_config, "engram_config", None) is not None
+                and getattr(parallel, "pipeline_parallel_size", 1) > 1
+            ):
+                raise NotImplementedError("Managed Engram draft loading with pipeline parallelism is unsupported")
             load_started_at = time.perf_counter()
             device_config = vllm_config.device_config
             load_config = self.load_config
@@ -760,27 +800,59 @@ class RForkModelLoader(BaseModelLoader):
                     )
                     source = "bypass"
                     timing.mark("bypass_local_loading")
+                    if managed_weights.enabled():
+                        bypass_coordinator = _RForkLoadCoordinator(vllm_config, skip_engram=skip_engram)
+                        with bypass_coordinator.stage("bypass checkpoint", fallback=False):
+                            vllm_config, model_config = managed_weights.mounted_configs(vllm_config, model_config)
+                        with bypass_coordinator.stage("bypass model loading", fallback=False):
+                            return _load_with_default_loader(vllm_config, model_config, self.load_config, prefix)
                     return _load_with_default_loader(vllm_config, model_config, self.load_config, prefix)
 
-                coordinator = _RForkLoadCoordinator(vllm_config)
+                coordinator = _RForkLoadCoordinator(vllm_config, skip_engram=skip_engram)
                 try:
                     # Keep session and TransferEngine initialization inside fallback-protected RFork loading.
                     with coordinator.stage("session setup"), timing.stage("session_setup"):
                         session = self._get_session(vllm_config, model_config)
                         session_scope.enter_context(session.loading())
                         model_state_snapshot = _snapshot_process_global_model_state(vllm_config)
+                    construction_config, construction_model_config = vllm_config, model_config
+                    has_engram_layers = any(
+                        getattr(getattr(model_config, name, None), "engram_layer_ids", None)
+                        for name in ("hf_text_config", "hf_config")
+                    )
+                    if (
+                        managed_weights.enabled()
+                        and not skip_engram
+                        and getattr(vllm_config, "engram_config", None)
+                        and has_engram_layers
+                    ):
+                        with coordinator.stage("Engram checkpoint", fallback=False):
+                            construction_config, construction_model_config = managed_weights.mounted_configs(
+                                vllm_config, model_config
+                            )
                     with coordinator.stage("model construction", fallback=False), timing.stage("model_construction"):
                         model_init_started = True
                         with target_device:
                             model = initialize_model(
-                                vllm_config=vllm_config,
-                                model_config=model_config,
+                                vllm_config=construction_config,
+                                model_config=construction_model_config,
                                 prefix=prefix,
                             )
 
                     with coordinator.stage("model state preparation"), timing.stage("model_state_preparation"):
                         model_state_prepared = False
-                        _prepare_rfork_model_state(model, model_config, load_config)
+                        preparation_model, names = model_config, None
+                        if managed_weights.enabled():
+                            from vllm_ascend.models.deepseek_mtp import AscendDeepSeekMTP
+
+                            if isinstance(model, AscendDeepSeekMTP):
+                                names = _bootstrap_checkpoint_names(model, model_config)
+                                if names is None:
+                                    _, preparation_model = managed_weights.mounted_configs(vllm_config, model_config)
+                        if names is None:
+                            _prepare_rfork_model_state(model, preparation_model, load_config)
+                        else:
+                            _prepare_rfork_model_state(model, preparation_model, load_config, names)
                         model_state_prepared = True
 
                     with coordinator.stage("host weight loading"), timing.stage("host_weight_loading"):
@@ -862,6 +934,9 @@ class RForkModelLoader(BaseModelLoader):
                             gc.collect()
                             torch.npu.empty_cache()
 
+                if managed_weights.enabled():
+                    with coordinator.stage("local checkpoint", fallback=False):
+                        vllm_config, model_config = managed_weights.mounted_configs(vllm_config, model_config)
                 with coordinator.stage("local model loading", fallback=False), timing.stage("local_model_loading"):
                     model = _load_with_default_loader(vllm_config, model_config, self.load_config, prefix)
 

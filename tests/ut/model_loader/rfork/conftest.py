@@ -178,6 +178,7 @@ def rfork_helpers(monkeypatch, local_weights):
     install("vllm_ascend.device.hardware_profile", get_current_hardware_profile=lambda: SimpleNamespace())
     package("vllm_ascend.model_loader")
     package("vllm_ascend.model_loader.rfork")
+    _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.managed_weights", "managed_weights.py")
     _load_module(monkeypatch, "vllm_ascend.model_loader.rfork.timing", "timing.py")
 
     safety = _load_module(monkeypatch, "rfork_restored_lifecycle_safety", "safety.py")
