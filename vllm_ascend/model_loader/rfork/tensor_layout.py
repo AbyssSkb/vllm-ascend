@@ -48,7 +48,7 @@ def _layout_digest(records: list[dict[str, Any]]) -> str:
 def build_structural_digest(
     tensors: list[tuple[str, torch.Tensor]], known_formats: dict[str, int] | None = None
 ) -> str:
-    """Hash the manifest's tensor IDs, shapes, dtypes, and NPU formats.
+    """Hash the manifest's tensor IDs, shapes, strides, dtypes, and NPU formats.
 
     Pass ``collect_transferable_tensors`` output to exclude runtime buffers.
     ``known_formats`` reuses NPU formats read during registration.
@@ -57,6 +57,7 @@ def build_structural_digest(
         {
             "name": name,
             "shape": tuple(int(dim) for dim in tensor.shape),
+            "stride": tuple(int(stride) for stride in tensor.stride()),
             "dtype": normalize_dtype_name(tensor.dtype),
             "npu_format": (
                 known_formats[name] if known_formats is not None and name in known_formats else read_npu_format(tensor)
