@@ -66,7 +66,6 @@ from vllm_ascend.model_loader.rfork.types import (
     RForkFallbackCleanupResult,
     RForkIdentity,
     RForkLifecycleState,
-    RForkSeedServiceStartResult,
 )
 
 
@@ -154,7 +153,7 @@ def _rfork_model_kind(session: RForkSession) -> str:
 
 
 def _log_rfork_load_summary(session: RForkSession, source: str, started_at: float) -> None:
-    # Include synchronous startup, but not deferred promotion after loader return.
+    # Exclude background seed publication after loader return.
     log_summary = logger.info if _is_rfork_summary_rank(session) else logger.debug
     log_summary(
         "RFork %s model loading completed: source=%s, elapsed=%.2fs",
@@ -176,17 +175,15 @@ def _start_rfork_seed_service(
         result = session.start_seed_service(model, processed_layout, structural_digest=structural_digest)
     except Exception:
         logger.exception(
-            "RFork %s model loaded from %s, but seed service startup raised; inference can continue.",
+            "RFork %s model loaded from %s, but seed service scheduling raised; inference can continue.",
             _rfork_model_kind(session),
             load_source,
         )
         return False
-    if result is RForkSeedServiceStartResult.DEFERRED:
-        return False
     started = bool(result)
     if not started:
         logger.warning(
-            "RFork %s model loaded from %s is ready, but seed service startup failed; inference can continue.",
+            "RFork %s model loaded from %s is ready, but seed service scheduling failed; inference can continue.",
             _rfork_model_kind(session),
             load_source,
         )
