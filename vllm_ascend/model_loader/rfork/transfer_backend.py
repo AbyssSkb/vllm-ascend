@@ -132,14 +132,6 @@ def _tensor_storage_owner(tensor: torch.Tensor) -> Any:
     raise RuntimeError("RFork could not retain the original storage owner for a registered tensor")
 
 
-def _append_unique_addresses(addresses: list[int], new_addresses: list[int]) -> None:
-    known = set(addresses)
-    for address in new_addresses:
-        if address not in known:
-            addresses.append(address)
-            known.add(address)
-
-
 def _validate_transferable_tensor_layouts(transferable_tensors: list[tuple[str, torch.Tensor]]) -> None:
     for name, tensor in transferable_tensors:
         validate_transferable_tensor_layout(name, tensor)
@@ -163,7 +155,6 @@ class RForkTransferBackend:
         self.weight_manifest: dict[str, Any] | None = None
         self.weight_formats: dict[str, int] | None = None
         self.registered_structural_digest: str | None = None
-        self.registered_weight_blocks: list[tuple[int, int]] = []
         self.registered_memory_addresses: list[int] = []
         self._registered_transferable_tensors: list[tuple[str, torch.Tensor]] | None = None
         self._registered_transferable_storages: list[Any] | None = None
@@ -234,7 +225,6 @@ class RForkTransferBackend:
         self.weight_manifest = None
         self.weight_formats = None
         self.registered_structural_digest = None
-        self.registered_weight_blocks = []
         self.registered_memory_addresses = []
         self._registered_transferable_tensors = None
         self._registered_transferable_storages = None
@@ -324,12 +314,12 @@ class RForkTransferBackend:
             return False
 
         timing.mark("stale_cleanup")
-        if self.registered_weight_blocks or self.registered_memory_addresses:
-            stale_block_count = len(self.registered_weight_blocks)
+        if self.registered_memory_addresses:
+            stale_block_count = len(self.registered_memory_addresses)
             if not self._unregister_weight_blocks(transfer_engine):
                 return False
             logger.info(
-                "Retried unregister for %d blocks left registered by a failed reset.",
+                "Retried unregister for %d addresses left registered by a failed reset.",
                 stale_block_count,
             )
 
@@ -422,65 +412,52 @@ class RForkTransferBackend:
                 logical_registrations.append((tensor_start, tensor_end - tensor_start, backing_start, backing_size))
 
         timing.mark("native_register_overhead")
-        registered_memory_addresses: list[int] = []
-        # Retain provisional metadata and owners before registration so failures remain recoverable.
-        self.weight_manifest = weight_mr_dict
-        self.weight_formats = weight_format_dict
-        self.registered_weight_blocks = list(merged_blocks)
-        self.registered_memory_addresses = []
-        self._registered_transferable_tensors = transferable_tensors
+        # Keep backing storage alive until every attempted registration is released.
         self._registered_transferable_storages = transferable_storages
-        if logical_registrations:
-            memory_registration_cls = self._memory_registration_cls
-            batch_register_memory_ex = getattr(transfer_engine, "batch_register_memory_ex", None)
-            if memory_registration_cls is None or not callable(batch_register_memory_ex):
+        memory_registration_cls = self._memory_registration_cls
+        batch_register_memory_ex = getattr(transfer_engine, "batch_register_memory_ex", None)
+        if memory_registration_cls is None or not callable(batch_register_memory_ex):
+            logger.error(
+                "RFork requires YuanRong TransferEngine with MemoryRegistration and batch_register_memory_ex support."
+            )
+            self._clear_registration_state()
+            return False
+
+        for batch_start in range(0, len(logical_registrations), MAX_MEMORY_REGISTRATION_BATCH_ITEMS):
+            registration_batch = logical_registrations[batch_start : batch_start + MAX_MEMORY_REGISTRATION_BATCH_ITEMS]
+            attempted_addresses = [registration[0] for registration in registration_batch]
+            self.registered_memory_addresses.extend(attempted_addresses)
+            try:
+                registrations = [memory_registration_cls(*registration) for registration in registration_batch]
+                timing.mark("native_calls")
+                try:
+                    result = batch_register_memory_ex(registrations)
+                finally:
+                    timing.mark("native_register_overhead")
+            except Exception as exc:
                 logger.error(
-                    "RFork requires YuanRong TransferEngine with MemoryRegistration and "
-                    "batch_register_memory_ex support."
+                    "TransferEngine memory registration raised for batch of %d logical regions: %s",
+                    len(registration_batch),
+                    exc,
                 )
-                self._clear_registration_state()
+                result = None
+
+            if result is None or result.is_error():
+                if result is not None:
+                    logger.error(
+                        "TransferEngine memory registration failed for batch of %d logical regions, ret: %s",
+                        len(registration_batch),
+                        result.to_string(),
+                    )
+                # Retain every attempted address and owner until unregistration confirms absence.
+                timing.mark("registration_rollback")
+                if not self._unregister_weight_blocks(transfer_engine):
+                    logger.error("RFork registration rollback is incomplete; preserving registration state for retry.")
                 return False
 
-            for batch_start in range(0, len(logical_registrations), MAX_MEMORY_REGISTRATION_BATCH_ITEMS):
-                registration_batch = logical_registrations[
-                    batch_start : batch_start + MAX_MEMORY_REGISTRATION_BATCH_ITEMS
-                ]
-                attempted_addresses = [registration[0] for registration in registration_batch]
-                _append_unique_addresses(self.registered_memory_addresses, attempted_addresses)
-                try:
-                    registrations = [memory_registration_cls(*registration) for registration in registration_batch]
-                    timing.mark("native_calls")
-                    try:
-                        result = batch_register_memory_ex(registrations)
-                    finally:
-                        timing.mark("native_register_overhead")
-                except Exception as exc:
-                    logger.error(
-                        "TransferEngine memory registration raised for batch of %d logical regions: %s",
-                        len(registration_batch),
-                        exc,
-                    )
-                    result = None
-
-                if result is None or result.is_error():
-                    if result is not None:
-                        logger.error(
-                            "TransferEngine memory registration failed for batch of %d logical regions, ret: %s",
-                            len(registration_batch),
-                            result.to_string(),
-                        )
-                    timing.mark("registration_rollback")
-                    # Retain every attempted address and owner until unregistration confirms absence.
-                    if self.registered_memory_addresses and not self._unregister_weight_blocks(transfer_engine):
-                        logger.error(
-                            "RFork registration rollback is incomplete; preserving registration state for retry."
-                        )
-                    return False
-
-                _append_unique_addresses(registered_memory_addresses, attempted_addresses)
-
-        # Publish confirmed addresses while retaining the manifest and owners for active transfers.
-        self.registered_memory_addresses = list(registered_memory_addresses)
+        self.weight_manifest = weight_mr_dict
+        self.weight_formats = weight_format_dict
+        self._registered_transferable_tensors = transferable_tensors
         self.registered_structural_digest = structural_digest
         logger.debug(
             "register_memory_region time: %.4fs, weights: %d",
@@ -498,47 +475,29 @@ class RForkTransferBackend:
         return True
 
     def _unregister_weight_blocks(self, transfer_engine: Any) -> bool:
-        remaining_addresses = list(dict.fromkeys(self.registered_memory_addresses))
-        if not remaining_addresses:
-            self._clear_registration_state()
-            return True
-
-        while remaining_addresses:
-            address_batch = remaining_addresses[:MAX_MEMORY_REGISTRATION_BATCH_ITEMS]
+        while self.registered_memory_addresses:
+            address_batch = self.registered_memory_addresses[:MAX_MEMORY_REGISTRATION_BATCH_ITEMS]
             try:
                 result = transfer_engine.batch_unregister_memory(address_batch)
             except Exception as exc:
-                self.registered_memory_addresses = list(remaining_addresses)
-                logger.error(
-                    "batch_unregister_memory raised for batch of %d regions: %s",
-                    len(address_batch),
-                    exc,
-                )
+                logger.error("batch_unregister_memory raised for batch of %d regions: %s", len(address_batch), exc)
                 return False
             if result is None or result.is_error():
                 if result is not None and self._is_not_found_result(result):
-                    # Retry per address because batch unregistration may stop at the first absent region.
-                    unresolved_addresses = self._unregister_addresses_individually(transfer_engine, address_batch)
-                    del remaining_addresses[: len(address_batch)]
-                    remaining_addresses = unresolved_addresses + remaining_addresses
-                    self.registered_memory_addresses = list(remaining_addresses)
-                    if unresolved_addresses:
-                        logger.error(
-                            "batch_unregister_memory left %d regions registered after a not-found result.",
-                            len(unresolved_addresses),
-                        )
-                        return False
-                    continue
-                self.registered_memory_addresses = list(remaining_addresses)
-                if result is not None:
+                    # A missing address prevents the batch from being fully released.
+                    unresolved = self._unregister_addresses_individually(transfer_engine, address_batch)
+                    self.registered_memory_addresses[: len(address_batch)] = unresolved
+                    if not unresolved:
+                        continue
+                    logger.error("batch_unregister_memory left %d regions registered.", len(unresolved))
+                elif result is not None:
                     logger.error(
                         "batch_unregister_memory failed for batch of %d regions, ret: %s",
                         len(address_batch),
                         result.to_string(),
                     )
                 return False
-            del remaining_addresses[: len(address_batch)]
-            self.registered_memory_addresses = list(remaining_addresses)
+            del self.registered_memory_addresses[: len(address_batch)]
 
         self._clear_registration_state()
         return True
@@ -573,7 +532,7 @@ class RForkTransferBackend:
 
     def _unregister_memory_region_locked(self) -> bool:
         start_unreg_mr_time = time.perf_counter()
-        if not self.registered_weight_blocks and not self.registered_memory_addresses:
+        if not self.registered_memory_addresses:
             self._clear_registration_state()
             logger.debug("unregister_memory_region skipped because no blocks are registered.")
             return True

@@ -294,14 +294,13 @@ def test_unregister_memory_region_releases_registered_tensor_owners():
         batch_unregister_memory=lambda *args: SimpleNamespace(is_error=lambda: False)
     )
     backend.weight_manifest = {"weight": (tensor.data_ptr(), tensor.numel(), 1)}
-    backend.registered_weight_blocks = [(tensor.data_ptr(), tensor.numel() * tensor.element_size())]
     backend.registered_memory_addresses = [tensor.data_ptr()]
     backend._registered_transferable_tensors = [("weight", tensor)]
 
     assert backend.unregister_memory_region()
     assert backend._registered_transferable_tensors is None
     assert backend.weight_manifest is None
-    assert backend.registered_weight_blocks == []
+    assert backend.registered_memory_addresses == []
 
 
 def test_unregister_memory_region_failure_preserves_state_for_retry():
@@ -327,18 +326,17 @@ def test_unregister_memory_region_failure_preserves_state_for_retry():
     backend = RForkTransferBackend()
     backend.transfer_engine = SimpleNamespace(batch_unregister_memory=unregister)
     backend.weight_manifest = {"weight": (tensor.data_ptr(), 6, 1)}
-    backend.registered_weight_blocks = blocks
     backend.registered_memory_addresses = [blocks[0][0]]
     backend._registered_transferable_tensors = owners
 
     assert not backend.unregister_memory_region()
-    assert backend.registered_weight_blocks == blocks
+    assert backend.registered_memory_addresses == [blocks[0][0]]
     assert backend._registered_transferable_tensors is owners
     assert backend.weight_manifest is not None
 
     assert backend.unregister_memory_region()
     assert attempts == [[blocks[0][0]], [blocks[0][0]]]
-    assert backend.registered_weight_blocks == []
+    assert backend.registered_memory_addresses == []
     assert backend._registered_transferable_tensors is None
 
 
@@ -364,7 +362,6 @@ def test_register_memory_region_uses_logical_ranges_with_allocator_backing(monke
         )
     )
     backend._memory_registration_cls = _MemoryRegistration
-    backend.registered_weight_blocks = []
     backend.registered_memory_addresses = []
     backend.weight_manifest = None
     backend._registered_transferable_tensors = None
@@ -420,7 +417,6 @@ def test_extended_registration_merges_overlapping_logical_ranges(monkeypatch):
         )
     )
     backend._memory_registration_cls = _MemoryRegistration
-    backend.registered_weight_blocks = []
     backend.registered_memory_addresses = []
     backend._registered_transferable_tensors = None
     monkeypatch.setattr(transfer_backend, "find_non_npu_state_tensors", lambda _model: [])
@@ -477,7 +473,6 @@ def test_finalize_retries_not_ready_and_clears_state_only_after_success():
     backend.transfer_engine = SimpleNamespace(finalize=lambda: _append_and_return(attempts, True, next(results)))
     backend.transfer_session_id = "session"
     backend.weight_manifest = {"weight": (1, 1, 1)}
-    backend.registered_weight_blocks = [(1, 1)]
     backend.registered_memory_addresses = [1]
     backend._registered_transferable_tensors = [("weight", torch.ones(1))]
     backend._not_ready_error_code = "not-ready"
@@ -487,7 +482,7 @@ def test_finalize_retries_not_ready_and_clears_state_only_after_success():
     assert len(attempts) == 2
     assert backend._is_initialized is False
     assert backend.transfer_session_id is None
-    assert backend.registered_weight_blocks == []
+    assert backend.registered_memory_addresses == []
     assert backend._registered_transferable_tensors is None
 
 
@@ -507,7 +502,6 @@ def test_finalize_failure_preserves_registered_tensor_owners():
     backend = RForkTransferBackend()
     backend.transfer_engine = SimpleNamespace(finalize=lambda: _Ret())
     backend.transfer_session_id = "session"
-    backend.registered_weight_blocks = [(1, 1)]
     backend.registered_memory_addresses = [1]
     backend._registered_transferable_tensors = owners
     backend._not_ready_error_code = "not-ready"
@@ -515,7 +509,7 @@ def test_finalize_failure_preserves_registered_tensor_owners():
 
     assert not backend.finalize_transfer_engine()
     assert backend._is_initialized is True
-    assert backend.registered_weight_blocks == [(1, 1)]
+    assert backend.registered_memory_addresses == [1]
     assert backend._registered_transferable_tensors is owners
 
 
@@ -560,12 +554,10 @@ def test_transfer_lifecycle_lock_serializes_concurrent_calls():
 
 def test_register_memory_region_rejects_second_registration_without_overwriting(monkeypatch):
     tensor = torch.arange(4)
-    old_blocks = [(123, 64)]
     old_info = {"old": (123, 4, 4)}
     old_owners = [("old", tensor)]
     backend = RForkTransferBackend()
     backend.transfer_engine = SimpleNamespace()
-    backend.registered_weight_blocks = old_blocks
     backend.registered_memory_addresses = [123]
     backend.weight_manifest = old_info
     backend._registered_transferable_tensors = old_owners
@@ -577,7 +569,7 @@ def test_register_memory_region_rejects_second_registration_without_overwriting(
         lambda *args: pytest.fail("register_memory_region must not rescan before stale unregister succeeds"),
     )
     assert not backend.register_memory_region(object(), False)
-    assert backend.registered_weight_blocks == old_blocks
+    assert backend.registered_memory_addresses == [123]
     assert backend.weight_manifest is old_info
     assert backend._registered_transferable_tensors is old_owners
 
@@ -602,7 +594,7 @@ def test_register_memory_region_retries_stale_blocks_before_registering(monkeypa
 
     assert unregistered_calls == [[stale_blocks[0][0]]]
     assert registrations == [(storage.data_ptr(), storage.numel() * storage.element_size(), storage.data_ptr(), 40)]
-    assert backend.registered_weight_blocks == [(storage.data_ptr(), 40)]
+    assert backend.registered_memory_addresses == [storage.data_ptr()]
 
 
 def test_register_memory_region_aborts_when_stale_unregister_fails(monkeypatch):
@@ -626,7 +618,7 @@ def test_register_memory_region_aborts_when_stale_unregister_fails(monkeypatch):
 
     assert registrations == []
     assert unregistered_calls == [[stale_blocks[0][0]]]
-    assert backend.registered_weight_blocks == stale_blocks
+    assert backend.registered_memory_addresses == [stale_blocks[0][0]]
 
 
 def test_unregister_splits_batches_and_preserves_only_unfinished_addresses(monkeypatch):
@@ -641,7 +633,6 @@ def test_unregister_splits_batches_and_preserves_only_unfinished_addresses(monke
 
     backend = RForkTransferBackend()
     backend.transfer_engine = SimpleNamespace(batch_unregister_memory=batch_unregister_memory)
-    backend.registered_weight_blocks = [(100, 1000)]
     backend.registered_memory_addresses = [120, 400, 800]
     backend._registered_transferable_tensors = [("weight", torch.ones(1))]
     monkeypatch.setattr(transfer_backend, "MAX_MEMORY_REGISTRATION_BATCH_ITEMS", 2)
@@ -731,7 +722,6 @@ def _make_register_memory_region_backend(
     backend._memory_registration_cls = (
         _MemoryRegistration if memory_registration_cls is _UNSET else memory_registration_cls
     )
-    backend.registered_weight_blocks = list(stale_blocks)
     backend.registered_memory_addresses = [address for address, _ in stale_blocks]
     backend.weight_manifest = None
     backend._registered_transferable_tensors = None
@@ -799,6 +789,32 @@ def test_register_memory_region_splits_large_registration_batches(monkeypatch):
     assert backend.registered_memory_addresses == [weight.data_ptr() for weight in weights]
 
 
+def test_register_publishes_manifest_only_after_all_batches_succeed(monkeypatch):
+    storage = torch.arange(12, dtype=torch.uint8)
+    weights = [storage[0:2], storage[4:6]]
+    backend, _, _ = _make_register_memory_region_backend(
+        monkeypatch,
+        [(f"weight_{index}", weight) for index, weight in enumerate(weights)],
+        [{"address": storage.data_ptr(), "size": storage.numel(), "state": "active_allocated"}],
+    )
+    monkeypatch.setattr(transfer_backend, "MAX_MEMORY_REGISTRATION_BATCH_ITEMS", 1)
+    calls = []
+
+    def register(batch):
+        assert backend.weight_manifest is None
+        assert backend._registered_transferable_tensors is None
+        assert backend.registered_structural_digest is None
+        assert backend._registered_transferable_storages
+        calls.append(batch)
+        return SimpleNamespace(is_error=lambda: False)
+
+    backend.transfer_engine.batch_register_memory_ex = register
+    assert backend.register_memory_region(object(), False)
+    assert len(calls) == 2
+    assert set(backend.weight_manifest) == {"weight_0", "weight_1"}
+    assert backend.registered_structural_digest
+
+
 def _single_block_snapshot(storage):
     return [
         {
@@ -836,7 +852,7 @@ def test_register_memory_region_clears_state_when_engine_lacks_registration_supp
     assert unregistered_calls == []
     assert backend.weight_manifest is None
     assert backend.weight_formats is None
-    assert backend.registered_weight_blocks == []
+    assert backend.registered_memory_addresses == []
     assert backend.registered_memory_addresses == []
     assert backend._registered_transferable_tensors is None
     assert backend._registered_transferable_storages is None
@@ -858,7 +874,7 @@ def test_register_memory_region_rolls_back_attempted_addresses_when_registration
     assert registrations == [(storage.data_ptr(), 40, storage.data_ptr(), 40)]
     assert unregistered_calls == [[storage.data_ptr()]]
     assert backend.weight_manifest is None
-    assert backend.registered_weight_blocks == []
+    assert backend.registered_memory_addresses == []
     assert backend.registered_memory_addresses == []
     assert backend._registered_transferable_tensors is None
 
@@ -878,10 +894,10 @@ def test_register_memory_region_retains_owners_when_rollback_also_fails(monkeypa
     # Keep addresses and tensor owners pinned when rollback fails so cleanup can retry safely.
     assert unregistered_calls == [[storage.data_ptr()]]
     assert backend.registered_memory_addresses == [storage.data_ptr()]
-    assert backend.registered_weight_blocks == [(storage.data_ptr(), 40)]
-    assert backend.weight_manifest is not None and "weight" in backend.weight_manifest
-    assert backend._registered_transferable_tensors is not None
-    assert [name for name, _ in backend._registered_transferable_tensors] == ["weight"]
+    assert backend.registered_memory_addresses == [storage.data_ptr()]
+    assert backend.weight_manifest is None
+    assert backend._registered_transferable_tensors is None
+    assert backend._registered_transferable_storages == [storage.untyped_storage()]
 
 
 def test_register_memory_region_rolls_back_earlier_batches_when_a_later_batch_fails(monkeypatch):
