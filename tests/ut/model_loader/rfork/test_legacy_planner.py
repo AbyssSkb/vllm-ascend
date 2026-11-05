@@ -279,46 +279,42 @@ def test_legacy_session_acquire_does_not_start_lease_renewal(runtime, monkeypatc
 
 
 @pytest.mark.parametrize("invalid_ttl", ["", 0, -1, "nan", "inf", "invalid"])
-def test_identifiable_legacy_lease_with_invalid_ttl_is_returned_best_effort(runtime, monkeypatch, invalid_ttl):
+def test_invalid_ttl_returns_allocation_for_cleanup(runtime, monkeypatch, invalid_ttl):
     planner = _LegacyPlannerAdapter(lease_ttl_header=invalid_ttl)
     client = _make_client(runtime, monkeypatch, planner)
     _advertise(client, planner)
 
-    assert client.acquire_seed() is None
+    with pytest.raises(runtime.client.InvalidSeedLeaseError, match="LEASE_TTL_SEC") as error:
+        client.acquire_seed()
+    assert planner.active_count == 1
+    assert client.release_seed_once(error.value.lease).name == "RELEASED"
     assert planner.active_count == 0
-    assert "/put_seed" in [path for _, path in planner.calls]
 
 
-def test_client_rejected_lease_blocks_followup_get_until_returned(runtime, monkeypatch):
+def test_invalid_lease_is_released_in_background_with_retries(runtime, monkeypatch):
+    entered, resume = Event(), Event()
     planner = _LegacyPlannerAdapter(
         lease_ttl_header="invalid",
-        put_statuses=[503, 503, 200, 200],
+        put_statuses=[503, 200],
+        put_entered=entered,
+        put_gate=resume,
+        block_put_on_call=1,
     )
-    client = _make_client(runtime, monkeypatch, planner)
-    _advertise(client, planner)
-
-    assert client.acquire_seed() is None
-    assert planner.active_count == 1
-    assert [path for _, path in planner.calls].count("/get_seed") == 1
-    assert planner.put_attempt_count == 1
-
-    # A pending put must be retried before allocating a second lease.
-    assert client.acquire_seed() is None
-    assert [path for _, path in planner.calls].count("/get_seed") == 1
+    session, backend = _make_legacy_session(runtime, monkeypatch, planner)
+    try:
+        assert not session.acquire_seed()
+        assert entered.wait(2)
+        assert session.seed_lease is not None
+        assert not session.acquire_seed()
+        assert [path for _, path in planner.calls].count("/get_seed") == 1
+        backend.read_weights_from_seed.assert_not_called()
+    finally:
+        resume.set()
+    _wait_for_release(session)
     assert planner.put_attempt_count == 2
-    assert planner.active_count == 1
-
-    planner.lease_ttl_header = _MISSING
-    lease = client.acquire_seed()
-    assert lease is not None
-    assert lease.lease_ttl_sec is None
-    assert [path for _, path in planner.calls].count("/get_seed") == 2
-    assert planner.put_attempt_count == 3
-    assert planner.active_count == 1
-    assert client.take_rejected_lease() is None
-
-    assert client.release_seed_once(lease).name == "RELEASED"
     assert planner.active_count == 0
+    assert session.seed_lease is None
+    assert session.shutdown()
 
 
 def test_confirmed_remove_route_treats_post_release_404_as_absent(runtime, monkeypatch):
