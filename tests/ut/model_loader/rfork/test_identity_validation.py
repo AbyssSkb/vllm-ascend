@@ -915,6 +915,16 @@ def test_structural_digest_tracks_shape_dtype_and_name_set(tensor_runtime):
     assert build([]) != build(base)
 
 
+def test_structural_digest_tracks_stride(tensor_runtime):
+    build = tensor_runtime.tensor_layout.build_structural_digest
+    contiguous = torch.arange(9).reshape(3, 3)
+    transposed = contiguous.t()
+
+    assert contiguous.shape == transposed.shape
+    assert build([("weight", contiguous)]) != build([("weight", transposed)])
+    assert build([("weight", contiguous)]) == build([("weight", contiguous.clone())])
+
+
 def test_structural_digest_tracks_npu_format(tensor_runtime, monkeypatch):
     # Layout conversion (e.g. ND -> NZ) rewrites npu_format without changing
     # name, shape, or dtype, so the digest must distinguish formats.
