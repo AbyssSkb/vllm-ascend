@@ -16,6 +16,14 @@ import requests
 from tests.ut.model_loader.rfork.session_test_utils import dummy_model
 
 
+def _wait_for_publication(session):
+    with session._lock:
+        worker = session.lease_release_thread
+    if worker is not None:
+        worker.join(5)
+        assert not worker.is_alive()
+
+
 @pytest.fixture
 def live_session(runtime, monkeypatch):
     """Real session, FastAPI/uvicorn listener and HTTP client; native NPU and planner injected."""
@@ -63,7 +71,8 @@ def live_session(runtime, monkeypatch):
 
 def test_session_serves_real_metadata_and_closes_listener(live_session):
     r = live_session
-    assert r.session.start_seed_service(dummy_model(), True) is r.runtime.types.RForkSeedServiceStartResult.STARTED
+    assert r.session.start_seed_service(dummy_model(), True)
+    _wait_for_publication(r.session)
     handle = r.session.seed_server
     assert handle.is_alive
     url = f"http://127.0.0.1:{handle.port}"
@@ -131,7 +140,8 @@ def test_configured_seed_port_falls_back_when_already_in_use(live_session):
     r.session.config = replace(r.session.config, seed_port_base=occupied_port)
 
     try:
-        assert r.session.start_seed_service(dummy_model(), True) is r.runtime.types.RForkSeedServiceStartResult.STARTED
+        assert r.session.start_seed_service(dummy_model(), True)
+        _wait_for_publication(r.session)
         assert r.session.seed_server.port != occupied_port
     finally:
         occupied.close()
@@ -149,7 +159,8 @@ def test_rejected_advertisement_cleans_real_server_before_unregister(live_sessio
         return True
 
     r.session.transfer_backend.unregister_memory_region.side_effect = unregister
-    assert r.session.start_seed_service(dummy_model(), True) is r.runtime.types.RForkSeedServiceStartResult.FAILED
+    assert r.session.start_seed_service(dummy_model(), True)
+    _wait_for_publication(r.session)
     assert r.session.seed_server is None
     r.session.transfer_backend.unregister_memory_region.assert_called_once()
 
@@ -168,7 +179,8 @@ def test_transient_initial_advertisement_recovers_without_restarting_instance(li
         return accepted
 
     r.session.planner.report_seed_once.side_effect = report
-    assert r.session.start_seed_service(dummy_model(), True) is r.runtime.types.RForkSeedServiceStartResult.STARTED
+    assert r.session.start_seed_service(dummy_model(), True)
+    _wait_for_publication(r.session)
     handle = r.session.seed_server
     assert handle.is_alive
     assert recovered.wait(2)
@@ -201,7 +213,8 @@ def test_lost_publish_response_cleans_or_retains_live_resources(live_session, mo
         return SimpleNamespace(status_code=200)
 
     monkeypatch.setattr(requests, "post", post)
-    assert r.session.start_seed_service(dummy_model(), True) is r.runtime.types.RForkSeedServiceStartResult.STARTED
+    assert r.session.start_seed_service(dummy_model(), True)
+    _wait_for_publication(r.session)
     assert planner.last_advertisement is not None
     assert remote_seeds and r.session.seed_server.is_alive
     r.session.transfer_backend.unregister_memory_region.assert_not_called()
@@ -248,6 +261,8 @@ def test_start_network_work_does_not_hold_state_lock(live_session, monkeypatch, 
     try:
         worker.start()
         assert entered.wait(3)
+        worker.join(1)
+        assert not worker.is_alive(), "seed service startup blocked the calling thread"
         assert r.session._lock.acquire(timeout=0.5), f"{phase} I/O still holds session state lock"
         try:
             assert r.session.state is r.runtime.types.RForkLifecycleState.CLEANUP_REQUIRED
@@ -261,7 +276,8 @@ def test_start_network_work_does_not_hold_state_lock(live_session, monkeypatch, 
         resume.set()
         worker.join(5)
     assert not worker.is_alive()
-    assert results == [r.runtime.types.RForkSeedServiceStartResult.FAILED]
+    _wait_for_publication(r.session)
+    assert results == [True]
     assert r.session.seed_server is None
     assert r.handles and all(not handle.is_alive for handle in r.handles)
     if phase == "health":

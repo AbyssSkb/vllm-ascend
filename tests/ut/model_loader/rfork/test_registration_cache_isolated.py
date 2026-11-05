@@ -5,6 +5,7 @@ import ctypes
 import enum
 import logging
 import sys
+import threading
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
@@ -303,11 +304,26 @@ def test_session_reuses_inventory_and_final_digest(runtime, monkeypatch, process
     backend._memory_registration_cls = lambda *fields: fields
     backend.transfer_session_id = "receiver-session"
     backend._is_initialized = True
-    monkeypatch.setattr(session, "_ensure_lease_release_retry_locked", lambda: None)
+    release_entered = threading.Event()
+    release_gate = threading.Event()
+    server_entered = threading.Event()
+    server_gate = threading.Event()
+
+    def release_lease(_lease):
+        release_entered.set()
+        assert release_gate.wait(3)
+        return runtime.types.LeaseReleaseResult.RELEASED
+
+    def start_server(*args, **kwargs):
+        server_entered.set()
+        assert server_gate.wait(3)
+        return Mock(is_alive=True, port=1234)
+
+    monkeypatch.setattr(session.planner, "release_seed_once", release_lease)
     monkeypatch.setattr(session, "_run_seed_heartbeat", lambda *args: None)
     monkeypatch.setattr(session.planner, "report_seed_once", lambda *args, **kwargs: True)
     monkeypatch.setattr(session.planner, "remove_seed", lambda: True)
-    monkeypatch.setattr(runtime.session, "start_rfork_server", Mock(return_value=Mock(is_alive=True, port=1234)))
+    monkeypatch.setattr(runtime.session, "start_rfork_server", start_server)
     verify = Mock(wraps=session.planner.verify_structural_digest)
     monkeypatch.setattr(session.planner, "verify_structural_digest", verify)
 
@@ -323,40 +339,56 @@ def test_session_reuses_inventory_and_final_digest(runtime, monkeypatch, process
         session.state = runtime.types.RForkLifecycleState.LEASED
         session.seed_lease = runtime.lease
         assert session.transfer_from_seed(model, processed_layout)
+        assert release_entered.wait(2)
+        release_worker = session.lease_release_thread
+        assert release_worker is not None
         assert collect.call_count == 1
         if not deferred:
-            session.seed_lease = None
+            release_gate.set()
+            release_worker.join(2)
+            assert not release_worker.is_alive()
+
         model.eval()
         digest = session.log_transferred_model_layout(model, processed_layout)
         assert digest == expected_digest
         assert collect.call_count == 2
-        result = session.start_seed_service(model, processed_layout, structural_digest=digest)
+        assert session.start_seed_service(model, processed_layout, structural_digest=digest)
         # Checkpoint-layout promotion needs a new registration after post-load processing.
         expected_scans = 2 + (not processed_layout)
         assert collect.call_count == expected_scans
         if deferred:
-            assert result is runtime.types.RForkSeedServiceStartResult.DEFERRED
             verify.assert_not_called()
             model.register_buffer("late_buffer", torch.ones(1))
             live_digest = layout.build_structural_digest(layout.collect_transferable_tensors(model, processed_layout))
             assert live_digest != expected_digest
-            session.seed_lease = None
-            session._promote_deferred_seed()
-            assert collect.call_count == expected_scans + processed_layout
-            if processed_layout:
-                verify.assert_called_once_with(live_digest)
-                assert session.state is runtime.types.RForkLifecycleState.INITIALIZED
-            else:
-                verify.assert_not_called()
-                assert session.state is runtime.types.RForkLifecycleState.SERVING
+            release_gate.set()
+            worker = release_worker
         else:
-            assert result is runtime.types.RForkSeedServiceStartResult.STARTED
+            assert server_entered.wait(2)
+            worker = session.lease_release_thread
+            assert worker is not None
+
+        if not (deferred and processed_layout):
+            assert server_entered.wait(2)
+        server_gate.set()
+        worker.join(2)
+        assert not worker.is_alive()
+        if deferred and processed_layout:
+            assert collect.call_count == expected_scans + 1
+            verify.assert_called_once_with(live_digest)
+            assert session.state is runtime.types.RForkLifecycleState.INITIALIZED
+        else:
             if processed_layout:
                 verify.assert_called_once_with(expected_digest)
             else:
                 verify.assert_not_called()
+            assert session.state is runtime.types.RForkLifecycleState.SERVING
     finally:
-        session.seed_lease = None
+        release_gate.set()
+        server_gate.set()
+        worker = session.lease_release_thread
+        if worker is not None:
+            worker.join(2)
         assert session.shutdown()
 
 

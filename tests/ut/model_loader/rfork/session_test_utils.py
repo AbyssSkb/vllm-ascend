@@ -37,3 +37,11 @@ def run_and_join(session):
     assert worker is not None
     worker.join(2)
     assert not worker.is_alive()
+
+
+def join_seed_worker(session):
+    with session._lock:
+        worker = session.lease_release_thread
+    if worker is not None:
+        worker.join(2)
+        assert not worker.is_alive()

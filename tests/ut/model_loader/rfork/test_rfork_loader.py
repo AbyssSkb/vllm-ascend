@@ -36,7 +36,6 @@ from vllm_ascend.model_loader.rfork.rfork_loader import (
 )
 from vllm_ascend.model_loader.rfork.types import (
     RForkFallbackCleanupResult,
-    RForkSeedServiceStartResult,
 )
 
 
@@ -704,7 +703,7 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
 
         def start_seed_service(self, model, processed_layout, *, structural_digest=None):
             events.append("start_seed_service")
-            return RForkSeedServiceStartResult.FAILED
+            return False
 
         def prepare_for_fallback(self):
             return True
@@ -737,7 +736,7 @@ def test_rfork_seed_start_failure_returns_valid_model_without_disk_reload(monkey
 
     assert result is model
     assert events.index("eval") < events.index("start_seed_service")
-    assert any("seed service startup failed" in args[0] for args in warnings)
+    assert any("seed service scheduling failed" in args[0] for args in warnings)
 
 
 def test_rfork_fallback_seed_is_deferred_when_only_lease_release_is_pending(monkeypatch):
@@ -766,7 +765,7 @@ def test_rfork_fallback_seed_is_deferred_when_only_lease_release_is_pending(monk
 
         def start_seed_service(self, model, processed_layout, *, structural_digest=None):
             seed_start_models.append(model)
-            return RForkSeedServiceStartResult.DEFERRED
+            return True
 
     monkeypatch.setattr(loader, "_ensure_rfork_session", lambda vc, mc: _Session())
     monkeypatch.setattr(loader, "_requires_processed_layout_transfer", lambda mc: False)
@@ -810,10 +809,9 @@ def test_rfork_seed_start_exception_does_not_escape(monkeypatch):
         _Session(),  # type: ignore[arg-type]
         object(),
         False,
-        [],
         load_source="fallback",
     )
-    assert any("seed service startup raised" in args[0] for args in exceptions)
+    assert any("seed service scheduling raised" in args[0] for args in exceptions)
 
 
 def test_rfork_fallback_clears_only_failed_model_state_before_reinit(monkeypatch):
