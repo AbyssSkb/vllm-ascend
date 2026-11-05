@@ -87,6 +87,19 @@ def test_session_serves_real_metadata_and_closes_listener(live_session):
     r.session.transfer_backend.finalize_transfer_engine.assert_called_once()
 
 
+def test_server_health_timeout_releases_listener_and_reports_handle(live_session, monkeypatch):
+    server = sys.modules["rfork_live_seed_server_test"]
+    monkeypatch.setattr(server.requests, "get", lambda *args, **kwargs: SimpleNamespace(status_code=503))
+    info = live_session.runtime.types.SeedTransferInfo("native-session", {"weight": [1234, 4, 4]}, {"weight": 2})
+
+    with pytest.raises(server.RForkSeedServerStartupError) as exc:
+        server.start_rfork_server("live-key", info, health_timeout_sec=0.05, bind_host="127.0.0.1")
+
+    assert exc.value.handle is not None
+    assert not exc.value.handle.is_alive
+    assert exc.value.handle.sock.fileno() == -1
+
+
 @pytest.mark.parametrize(
     ("global_rank", "is_draft_model", "expected_port"),
     [
