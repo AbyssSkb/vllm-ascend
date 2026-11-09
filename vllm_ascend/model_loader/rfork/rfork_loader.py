@@ -16,13 +16,13 @@
 
 import gc
 import json
-import os
 import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -316,55 +316,33 @@ def _make_fallback_load_config(load_config: LoadConfig) -> LoadConfig:
     return fallback_load_config
 
 
-def _get_checkpoint_weight_names(model: Module, model_config: ModelConfig, load_config: LoadConfig) -> set[str]:
+def _get_checkpoint_weight_names(model_config: ModelConfig) -> set[str]:
     from safetensors import SafetensorError, safe_open
-    from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
-    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
     from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
-    loader = DefaultModelLoader(_make_fallback_load_config(load_config))
-    sources = [
-        DefaultModelLoader.Source(
-            model_config.model,
-            model_config.revision,
-            fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
-            allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
-        ),
-        *getattr(model, "secondary_weights", ()),
-    ]
+    from vllm_ascend.quantization.utils import get_model_file
+
+    model_path = Path(model_config.model)
+    if model_path.is_dir():
+        index_names = [path.name for path in model_path.glob("*.safetensors.index.json")]
+    else:
+        index_names = list_filtered_repo_files(
+            model_config.model, ["*.safetensors.index.json"], revision=model_config.revision
+        )
+        index_names = [name for name in index_names if "/" not in name]
+
     weight_names: set[str] = set()
-    for source in sources:
-        folder, files, use_safetensors = loader._prepare_weights(
-            source.model_or_path,
-            source.subfolder,
-            source.revision,
-            source.fall_back_to_pt,
-            source.allow_patterns_overrides,
-        )
-        if not use_safetensors:
-            raise ValueError("RFork model-state preparation requires safetensors checkpoint metadata")
-        # v0.30's loader returns three fields; mirror its auto-format index selection.
-        index_file = (
-            "consolidated.safetensors.index.json"
-            if list_filtered_repo_files(
-                model_name_or_path=source.model_or_path,
-                allow_patterns=["consolidated*.safetensors"],
-                revision=source.revision,
-            )
-            else SAFE_WEIGHTS_INDEX_NAME
-        )
-        index_path = os.path.join(folder, index_file)
-        if os.path.isfile(index_path):
+    for index_name in sorted(index_names):
+        index_path = get_model_file(model_config.model, index_name, revision=model_config.revision)
+        if index_path is not None:
             with open(index_path, encoding="utf-8") as index_stream:
-                weight_map = json.load(index_stream)["weight_map"]
-            weight_names.update(source.prefix + name for name in weight_map)
-            continue
-        for path in files:
+                weight_names.update(json.load(index_stream)["weight_map"])
+            break
+    else:
+        for path in model_path.glob("*.safetensors"):
             try:
-                with safe_open(path, framework="pt", device="cpu") as checkpoint:
-                    # safe_open is not a dict, so SIM118's iteration advice does not apply.
-                    names = checkpoint.keys()
-                    weight_names.update(source.prefix + name for name in names)
+                with safe_open(str(path), framework="pt", device="cpu") as checkpoint:
+                    weight_names.update(checkpoint.keys())
             except SafetensorError as exc:
                 raise ValueError(f"RFork could not read checkpoint metadata from {path}") from exc
     if not weight_names:
@@ -372,18 +350,70 @@ def _get_checkpoint_weight_names(model: Module, model_config: ModelConfig, load_
     return weight_names
 
 
-def _prepare_rfork_model_state(model: Module, model_config: ModelConfig, load_config: LoadConfig) -> None:
-    from vllm_ascend.models.deepseek_mtp import AscendDeepSeekMTP
-
-    if not isinstance(model, AscendDeepSeekMTP):
+def _prepare_rfork_model_state(model: Module, model_config: ModelConfig) -> None:
+    architectures = getattr(model_config, "architectures", ())
+    deepseek_mtp = any(name in architectures for name in ("DeepSeekMTPModel", "DeepseekV32MTPModel"))
+    deepseek_dspark = any(name in architectures for name in ("DSparkDraftModel", "DeepseekV41DSparkModel"))
+    qwen_dspark = any(name in architectures for name in ("Qwen3DSparkModel", "Qwen3OmniDSparkModel"))
+    glm_dspark = "Glm5DSparkForCausalLM" in architectures
+    if not (deepseek_mtp or deepseek_dspark or qwen_dspark or glm_dspark):
         return
 
-    names = list(_get_checkpoint_weight_names(model, model_config, load_config))
-    if model.quant_config is not None and (mapper := model.quant_config.get_cache_scale_mapper()):
-        names = mapper.apply_list(names)
-    # The model's rot mapper cannot change head ownership, so only the cache mapper is needed here.
-    local_weight_names = {name for name, _ in model.named_parameters()}
-    model._maybe_set_own_lm_head(set(names) & local_weight_names)
+    names = _get_checkpoint_weight_names(model_config)
+    if deepseek_mtp:
+        if model.quant_config is not None and (mapper := model.quant_config.get_cache_scale_mapper()):
+            names = set(mapper.apply_list(list(names)))
+        # The model's rot mapper cannot change head ownership, so only the cache mapper is needed here.
+        local_weight_names = {name for name, _ in model.named_parameters()}
+        model._maybe_set_own_lm_head(names & local_weight_names)
+    elif deepseek_dspark:
+        from vllm.model_executor.models.utils import process_eagle_weight
+
+        for name in names:
+            if name == "embed.weight" and not model.rotation_path:
+                name = "model.embed_tokens.weight"
+            elif name == "head.weight" and not model.rotation_path:
+                name = "lm_head.weight"
+            else:
+                name = model._remap_dspark_name(name)
+            if name is not None:
+                process_eagle_weight(model, name)
+    elif glm_dspark:
+        model.has_own_embed_tokens = "embed_tokens.weight" in names
+        model.has_own_lm_head = "lm_head.weight" in names
+        model.enable_confidence_head = any(name.startswith("confidence_head.") for name in names)
+        if model.draft_id_to_target_id is not None and (
+            not model.has_own_lm_head or not ({"d2t", "draft_id_to_target_id"} & names)
+        ):
+            raise ValueError("Reduced-vocabulary GLM MLA DSpark requires d2t and draft lm_head weights.")
+        if model.config.vocab_size > model.target_vocab_size and not model.has_own_embed_tokens:
+            raise ValueError("Expanded-vocabulary GLM MLA DSpark requires draft embedding weights.")
+    elif qwen_dspark:
+        from vllm.model_executor.models.utils import process_eagle_weight
+
+        draft_names = {name for name in names if "t2d" not in name}
+        for name in draft_names:
+            process_eagle_weight(model, name)
+        if model.config.vocab_size > model.target_vocab_size and not any(
+            "embed_tokens" in name for name in draft_names
+        ):
+            raise ValueError(
+                "Qwen3 DSpark checkpoints whose input vocab_size is larger than "
+                "the target vocabulary must include embed_tokens weights."
+            )
+        if model.config.draft_vocab_size < model.target_vocab_size:
+            if not any("lm_head" in name for name in draft_names):
+                raise ValueError(
+                    "Reduced-vocabulary Qwen3 DSpark checkpoints must include "
+                    "lm_head weights; the full target lm_head cannot be shared."
+                )
+            if not any("d2t" in name for name in draft_names):
+                raise ValueError(
+                    "Reduced-vocabulary Qwen3 DSpark checkpoints must include a "
+                    "d2t mapping so sampled draft ids can be converted to target ids."
+                )
+        if not any("confidence_head" in name for name in draft_names):
+            model.model.confidence_head = None
 
 
 def _load_with_default_loader(
@@ -820,7 +850,7 @@ class RForkModelLoader(BaseModelLoader):
 
                 with coordinator.stage("model state preparation"):
                     model_state_prepared = False
-                    _prepare_rfork_model_state(model, model_config, load_config)
+                    _prepare_rfork_model_state(model, model_config)
                     model_state_prepared = True
 
                 with coordinator.stage("host weight loading"):

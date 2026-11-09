@@ -1,24 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import ast
 import json
+import typing
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import regex as re
 import torch
 from safetensors.torch import save_file
 from torch.nn import Module
 from torch.utils.hooks import RemovableHandle
 
-from .rfork_test_support import _load_module, _stub
+from .rfork_test_support import RFORK_ROOT, _load_module, _stub
 
 
-@pytest.fixture
-def mtp_model(rfork_helpers, tensor_runtime, monkeypatch):
+@pytest.fixture(params=["DeepSeekMTPModel", "DeepseekV32MTPModel"])
+def mtp_model(request, rfork_helpers, tensor_runtime, monkeypatch):
     class WeightsMapper:
         def __init__(self, *, orig_to_new_prefix):
             self.orig_to_new_prefix = orig_to_new_prefix
@@ -47,7 +50,6 @@ def mtp_model(rfork_helpers, tensor_runtime, monkeypatch):
     _stub(monkeypatch, "vllm.sequence", IntermediateTensors=object)
     _stub(monkeypatch, "vllm_ascend.utils", is_rot_weight_used=lambda _config: False)
     module = _load_module(monkeypatch, "_rfork_test_mtp_model", "../../models/deepseek_mtp.py")
-    monkeypatch.setattr(rfork_helpers.mtp_module, "AscendDeepSeekMTP", module.AscendDeepSeekMTP)
     model = module.AscendDeepSeekMTP.__new__(module.AscendDeepSeekMTP)
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(num_hidden_layers=3)
@@ -59,7 +61,7 @@ def mtp_model(rfork_helpers, tensor_runtime, monkeypatch):
     layer.shared_head.head = torch.nn.Linear(2, 2, bias=False)
     model.model.layers = torch.nn.ModuleDict({"3": layer})
     monkeypatch.setattr(tensor_runtime.tensor_layout, "is_tensor_on_transfer_device", lambda _tensor: True)
-    return SimpleNamespace(model=model, mapper=WeightsMapper)
+    return SimpleNamespace(model=model, mapper=WeightsMapper, architecture=request.param)
 
 
 @pytest.mark.parametrize(
@@ -85,7 +87,7 @@ def test_mtp_checkpoint_preparation_preserves_registered_structure(
     unprepared_digest = layout.build_structural_digest(layout.collect_transferable_tensors(model, processed_layout))
 
     monkeypatch.setattr(rfork_helpers.loader, "_get_checkpoint_weight_names", lambda *args: names)
-    rfork_helpers.loader._prepare_rfork_model_state(model, SimpleNamespace(), SimpleNamespace())
+    rfork_helpers.loader._prepare_rfork_model_state(model, SimpleNamespace(architectures=[mtp_model.architecture]))
     before = layout.collect_transferable_tensors(model, processed_layout)
     digest = layout.build_structural_digest(before)
     loaded = model.load_weights((name, original) for name in names)
@@ -113,7 +115,7 @@ def test_mtp_checkpoint_preparation_ignores_nonlocal_head(rfork_helpers, mtp_mod
         lambda *args: {"model.layers.3.shared_head.head.weight"},
     )
 
-    rfork_helpers.loader._prepare_rfork_model_state(model, SimpleNamespace(), SimpleNamespace())
+    rfork_helpers.loader._prepare_rfork_model_state(model, SimpleNamespace(architectures=[mtp_model.architecture]))
 
     assert model.has_own_lm_head is False
     assert not hasattr(model, "lm_head")
@@ -128,7 +130,7 @@ def test_mtp_preparation_applies_same_checkpoint_mappers_as_loading(rfork_helper
     raw_names = {"checkpoint_head.weight", "checkpoint_rot.weight"}
 
     monkeypatch.setattr(rfork_helpers.loader, "_get_checkpoint_weight_names", lambda *args: raw_names)
-    rfork_helpers.loader._prepare_rfork_model_state(model, SimpleNamespace(), SimpleNamespace())
+    rfork_helpers.loader._prepare_rfork_model_state(model, SimpleNamespace(architectures=[mtp_model.architecture]))
     assert model.has_own_lm_head is True
     assert model.lm_head is model.model.layers["3"].shared_head.head
     loaded = model.load_weights((name, torch.ones(2)) for name in raw_names)
@@ -137,6 +139,119 @@ def test_mtp_preparation_applies_same_checkpoint_mappers_as_loading(rfork_helper
     assert model.has_own_lm_head is True
     model.load_weights([])
     assert model.has_own_lm_head is False
+
+
+@pytest.fixture(params=["deepseek_v4", "deepseek_v41"])
+def dspark_model(request, rfork_helpers, monkeypatch):
+    """Use the real model loading methods with small CPU parameters."""
+    classes = {}
+
+    def process_eagle_weight(model, name):
+        if "embed_tokens" in name:
+            model.has_own_embed_tokens = True
+        if "lm_head" in name:
+            model.has_own_lm_head = True
+
+    _stub(monkeypatch, "vllm.model_executor.models", __path__=[])
+    _stub(monkeypatch, "vllm.model_executor.models.utils", process_eagle_weight=process_eagle_weight)
+    for family, class_name in (
+        ("deepseek_v4", "DSparkDeepseekV4ForCausalLM"),
+        ("deepseek_v41", "DSparkDeepseekV41ForCausalLM"),
+    ):
+        path = RFORK_ROOT.parents[1] / "models" / family / "dspark.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        source_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+        methods = [
+            node
+            for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"load_weights", "_remap_dspark_name", "_remap_checkpoint_name"}
+        ]
+
+        namespace = {
+            "Iterable": Iterable,
+            "typing": typing,
+            "torch": torch,
+            "re": re,
+            "process_eagle_weight": process_eagle_weight,
+            "get_tensor_model_parallel_rank": lambda: 0,
+            "get_tensor_model_parallel_world_size": lambda: 1,
+            "default_weight_loader": lambda param, weight: param.data.copy_(weight),
+            "logger": SimpleNamespace(info_once=lambda *args: None),
+        }
+        exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace)
+
+        class DraftModel(torch.nn.Module):
+            has_own_embed_tokens = False
+            has_own_lm_head = False
+
+            def __init__(self, rotation_path, layers):
+                super().__init__()
+                self.rotation_path = rotation_path
+                self.config = SimpleNamespace(num_attention_heads=1, num_hidden_layers=3)
+                self.model = torch.nn.Module()
+                self.model.num_dspark_layers = layers
+                self.model.get_expert_mapping = lambda: []
+                self.model.embed_tokens = torch.nn.Embedding(2, 2)
+                self.lm_head = torch.nn.Linear(2, 2, bias=False)
+
+        for method in methods:
+            setattr(DraftModel, method.name, namespace[method.name])
+        classes[family] = DraftModel
+    return request.param, classes[request.param]
+
+
+@pytest.mark.parametrize(
+    ("names", "rotation", "layers", "expected"),
+    [
+        ({"mtp.0.embed.weight", "mtp.2.head.weight"}, "rotation", 3, (True, True)),
+        ({"mtp.0.embed.weight"}, "rotation", 3, (True, False)),
+        ({"mtp.2.head.weight"}, "rotation", 3, (False, True)),
+        ({"unrelated.weight"}, "rotation", 3, (False, False)),
+        ({"embed.weight", "head.weight"}, None, 3, (True, True)),
+        ({"embed.weight", "head.weight"}, "rotation", 3, (False, False)),
+        ({"mtp.0.embed.weight", "mtp.3.head.weight"}, "rotation", 4, (True, True)),
+    ],
+)
+def test_dspark_checkpoint_preparation_matches_local_loading(
+    rfork_helpers, dspark_model, monkeypatch, names, rotation, layers, expected
+):
+    family, model_class = dspark_model
+    local = model_class(rotation, layers)
+    receiver = model_class(rotation, layers)
+    before = {name: param.detach().clone() for name, param in receiver.named_parameters()}
+    local.load_weights((name, torch.ones(2, 2)) for name in names)
+    monkeypatch.setattr(rfork_helpers.loader, "_get_checkpoint_weight_names", lambda *_args: names)
+
+    architecture = "DSparkDraftModel" if family == "deepseek_v4" else "DeepseekV41DSparkModel"
+    rfork_helpers.loader._prepare_rfork_model_state(receiver, SimpleNamespace(architectures=[architecture]))
+
+    assert (local.has_own_embed_tokens, local.has_own_lm_head) == expected
+    assert (receiver.has_own_embed_tokens, receiver.has_own_lm_head) == expected
+    for name, param in receiver.named_parameters():
+        torch.testing.assert_close(param, before[name])
+
+
+def test_dspark_preparation_uses_quantized_index_without_reading_shards(
+    rfork_helpers, dspark_model, checkpoint_files, monkeypatch, tmp_path
+):
+    family, model_class = dspark_model
+    receiver = model_class("rotation", 3)
+    weights = {name: "weights.safetensors" for name in ("mtp.0.embed.weight", "mtp.2.head.weight")}
+    (tmp_path / "quant_model_weights.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weights}), encoding="utf-8"
+    )
+
+    def fail_open(*args, **kwargs):
+        raise AssertionError("checkpoint preparation must not read tensor shards when an index is available")
+
+    monkeypatch.setattr("safetensors.safe_open", fail_open)
+    architecture = "DSparkDraftModel" if family == "deepseek_v4" else "DeepseekV41DSparkModel"
+    config = SimpleNamespace(model=str(tmp_path), revision=None, architectures=[architecture])
+    rfork_helpers.loader._prepare_rfork_model_state(receiver, config)
+
+    assert receiver.has_own_embed_tokens
+    assert receiver.has_own_lm_head
 
 
 @pytest.mark.parametrize(
@@ -221,135 +336,114 @@ def test_fallback_reset_restores_ascend_globals_and_only_removes_new_dynamo_hook
 
 
 @pytest.fixture
-def checkpoint_loader(monkeypatch, rfork_helpers):
-    @dataclass
-    class CheckpointSource:
-        model_or_path: str
-        revision: str | None
-        subfolder: str | None = None
-        prefix: str = ""
-        fall_back_to_pt: bool = True
-        allow_patterns_overrides: list[str] | None = None
+def checkpoint_files(monkeypatch, rfork_helpers):
+    def get_model_file(model, filename, revision=None):
+        path = Path(model) / filename
+        return path if path.is_file() else None
 
-    calls = []
-    folders: dict[str, str] = {}
-    repo_files: dict[str, list[str]] = {}
-    selections: dict[str, tuple[list[str], bool]] = {}
-    configs = []
-
-    class DefaultModelLoader:
-        Source = CheckpointSource
-
-        def __init__(self, load_config):
-            configs.append(load_config)
-
-        def _prepare_weights(self, *args):
-            calls.append(args)
-            return folders.get(args[0], "unused"), *selections[args[0]]
-
-    _stub(monkeypatch, "vllm.model_executor.model_loader.default_loader", DefaultModelLoader=DefaultModelLoader)
-    _stub(monkeypatch, "transformers.utils", SAFE_WEIGHTS_INDEX_NAME="model.safetensors.index.json")
-    _stub(
-        monkeypatch,
-        "vllm.transformers_utils.repo_utils",
-        list_filtered_repo_files=lambda **kwargs: repo_files.get(kwargs["model_name_or_path"], []),
-    )
-    return SimpleNamespace(
-        Source=CheckpointSource,
-        calls=calls,
-        folders=folders,
-        repo_files=repo_files,
-        selections=selections,
-        configs=configs,
-    )
+    _stub(monkeypatch, "vllm_ascend.quantization", __path__=[])
+    _stub(monkeypatch, "vllm.transformers_utils.repo_utils", list_filtered_repo_files=lambda *args, **kwargs: [])
+    return _stub(monkeypatch, "vllm_ascend.quantization.utils", get_model_file=get_model_file)
 
 
-def test_checkpoint_names_follow_selected_sources_and_prefixes(rfork_helpers, checkpoint_loader, tmp_path):
-    primary = tmp_path / "selected.safetensors"
-    secondary = tmp_path / "secondary.safetensors"
-    save_file({"model.layers.3.shared_head.head.weight": torch.ones(2)}, primary)
-    save_file({"head.weight": torch.zeros(2)}, secondary)
-    save_file({"unselected.weight": torch.ones(2)}, tmp_path / "stale.safetensors")
-    checkpoint_loader.selections.update(primary=([str(primary)], True), secondary=([str(secondary)], True))
-    model = Module()
-    model.fall_back_to_pt_during_load = False
-    model.allow_patterns_overrides = ["selected*.safetensors"]
-    model.secondary_weights = [
-        checkpoint_loader.Source("secondary", "secondary-revision", "subfolder", "aux.", False, ["secondary*"])
-    ]
-    load_config = SimpleNamespace(load_format="rfork", model_loader_extra_config={"rfork_scheduler_url": "planner"})
-
-    names = rfork_helpers.loader._get_checkpoint_weight_names(
-        model, SimpleNamespace(model="primary", revision="primary-revision"), load_config
-    )
-
-    assert names == {"model.layers.3.shared_head.head.weight", "aux.head.weight"}
-    assert checkpoint_loader.calls == [
-        ("primary", None, "primary-revision", False, ["selected*.safetensors"]),
-        ("secondary", "subfolder", "secondary-revision", False, ["secondary*"]),
-    ]
-    assert checkpoint_loader.configs[0].load_format == "auto"
-    assert checkpoint_loader.configs[0].model_loader_extra_config == {}
-    assert load_config.load_format == "rfork"
-    assert load_config.model_loader_extra_config == {"rfork_scheduler_url": "planner"}
-
-
-@pytest.mark.parametrize("mistral", [False, True])
+@pytest.mark.parametrize(
+    "index_file",
+    [
+        "model.safetensors.index.json",
+        "quant_model_weights.safetensors.index.json",
+        "consolidated.safetensors.index.json",
+        "custom.safetensors.index.json",
+    ],
+)
 def test_checkpoint_names_use_index_without_opening_shards(
-    rfork_helpers, checkpoint_loader, monkeypatch, tmp_path, mistral
+    rfork_helpers, checkpoint_files, monkeypatch, tmp_path, index_file
 ):
     weight_map = {
         "model.layers.0.weight": "shard-a.safetensors",
         "model.layers.1.weight": "shard-b.safetensors",
     }
-    index_file = "consolidated.safetensors.index.json" if mistral else "model.safetensors.index.json"
     (tmp_path / index_file).write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
-    checkpoint_loader.folders["model"] = str(tmp_path)
-    checkpoint_loader.repo_files["model"] = ["consolidated.safetensors"] if mistral else []
-    checkpoint_loader.selections["model"] = (
-        [str(tmp_path / "shard-a.safetensors"), str(tmp_path / "shard-b.safetensors")],
-        True,
-    )
 
     def fail_open(*args, **kwargs):
         raise AssertionError("indexed checkpoint must not open every shard")
 
     monkeypatch.setattr("safetensors.safe_open", fail_open)
-    model = Module()
-    model.allow_patterns_overrides = ["shard-*.safetensors"]
-    names = rfork_helpers.loader._get_checkpoint_weight_names(
-        model,
-        SimpleNamespace(model="model", revision=None),
-        SimpleNamespace(load_format="rfork", model_loader_extra_config={}),
+    names = rfork_helpers.loader._get_checkpoint_weight_names(SimpleNamespace(model=str(tmp_path), revision=None))
+    assert names == set(weight_map)
+
+
+def test_checkpoint_names_read_safetensors_headers_without_index(rfork_helpers, checkpoint_files, tmp_path):
+    save_file({"model.layers.0.weight": torch.ones(2)}, tmp_path / "shard-a.safetensors")
+    save_file({"model.layers.1.weight": torch.ones(2)}, tmp_path / "shard-b.safetensors")
+
+    names = rfork_helpers.loader._get_checkpoint_weight_names(SimpleNamespace(model=str(tmp_path), revision=None))
+
+    assert names == {"model.layers.0.weight", "model.layers.1.weight"}
+
+
+def test_checkpoint_names_find_remote_index_with_revision(rfork_helpers, checkpoint_files, monkeypatch, tmp_path):
+    index = tmp_path / "custom.safetensors.index.json"
+    index.write_text(json.dumps({"weight_map": {"draft.weight": "draft.safetensors"}}), encoding="utf-8")
+    calls = []
+
+    def get_model_file(model, filename, revision=None):
+        calls.append((model, filename, revision))
+        return index if filename == index.name else None
+
+    def list_files(model, patterns, revision=None):
+        assert (model, patterns, revision) == ("org/model", ["*.safetensors.index.json"], "v1")
+        return ["nested/ignored.safetensors.index.json", index.name]
+
+    _stub(monkeypatch, "vllm.transformers_utils.repo_utils", list_filtered_repo_files=list_files)
+    checkpoint_files.get_model_file = get_model_file
+    names = rfork_helpers.loader._get_checkpoint_weight_names(SimpleNamespace(model="org/model", revision="v1"))
+
+    assert names == {"draft.weight"}
+    assert all(model == "org/model" and revision == "v1" for model, _, revision in calls)
+
+
+def test_checkpoint_names_use_first_index_in_sorted_order(rfork_helpers, checkpoint_files, tmp_path):
+    for name, key in (("z.safetensors.index.json", "later.weight"), ("a.safetensors.index.json", "first.weight")):
+        (tmp_path / name).write_text(json.dumps({"weight_map": {key: "weights.safetensors"}}), encoding="utf-8")
+
+    names = rfork_helpers.loader._get_checkpoint_weight_names(SimpleNamespace(model=str(tmp_path), revision=None))
+
+    assert names == {"first.weight"}
+
+
+def test_mtp_preparation_uses_quantized_index(rfork_helpers, mtp_model, checkpoint_files, tmp_path):
+    head_name = "model.layers.3.shared_head.head.weight"
+    (tmp_path / "quant_model_weights.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {head_name: "quant_model_weights-00001.safetensors"}}), encoding="utf-8"
     )
 
-    assert names == set(weight_map)
+    model = mtp_model.model
+    config = SimpleNamespace(model=str(tmp_path), revision=None, architectures=[mtp_model.architecture])
+    rfork_helpers.loader._prepare_rfork_model_state(model, config)
+
+    assert model.has_own_lm_head is True
+    assert model.lm_head is model.model.layers["3"].shared_head.head
 
 
 @pytest.mark.parametrize(
     ("metadata", "expected_error"),
     [
-        ("pt", "requires safetensors checkpoint metadata"),
         ("corrupt", "could not read checkpoint metadata"),
         ("empty", "received empty checkpoint metadata"),
-        ("missing", "model.safetensors"),
+        ("missing", "received empty checkpoint metadata"),
     ],
 )
 def test_checkpoint_names_reject_unavailable_metadata(
-    rfork_helpers, checkpoint_loader, tmp_path, metadata, expected_error
+    rfork_helpers, checkpoint_files, tmp_path, metadata, expected_error
 ):
     path = tmp_path / "model.safetensors"
     if metadata == "corrupt":
         path.write_bytes(b"invalid safetensors")
     elif metadata == "empty":
         save_file({}, path)
-    checkpoint_loader.selections["model"] = ([str(path)], metadata != "pt")
-    config = SimpleNamespace(load_format="rfork", model_loader_extra_config={})
 
     with pytest.raises((OSError, ValueError), match=expected_error):
-        rfork_helpers.loader._get_checkpoint_weight_names(
-            Module(), SimpleNamespace(model="model", revision=None), config
-        )
+        rfork_helpers.loader._get_checkpoint_weight_names(SimpleNamespace(model=str(tmp_path), revision=None))
 
 
 @pytest.mark.parametrize("processed_layout", [False, True])
@@ -387,8 +481,6 @@ def test_model_state_preparation_precedes_registration_and_guards_fallback(
     class OtherModel(Module):
         def _maybe_set_own_lm_head(self, weight_names):
             raise AssertionError("RFork must not prepare unrelated model types")
-
-    monkeypatch.setattr(rfork_helpers.mtp_module, "AscendDeepSeekMTP", Model)
 
     def initialize(**kwargs):
         nonlocal model_ref
@@ -444,7 +536,8 @@ def test_model_state_preparation_precedes_registration_and_guards_fallback(
         "get_ascend_config",
         lambda: SimpleNamespace(eplb_config=SimpleNamespace(dynamic_eplb=False, expert_map_record_path=None)),
     )
-    model_config = SimpleNamespace(dtype=torch.float32)
+    architecture = "UnrelatedModel" if outcome == "other_model" else "DeepSeekMTPModel"
+    model_config = SimpleNamespace(dtype=torch.float32, architectures=[architecture])
     vllm_config = SimpleNamespace(device_config=SimpleNamespace(device="cpu"), model_config=model_config)
 
     result = loader.load_model(vllm_config, model_config)

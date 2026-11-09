@@ -323,9 +323,9 @@ def test_loader_loads_local_state_before_registration_or_shared_reuse(
     model.table = torch.nn.Module()
     prepare_model_state = runtime._prepare_rfork_model_state
 
-    def prepare_state(model, model_config, load_config):
+    def prepare_state(model, model_config):
         events.append("prepare")
-        prepare_model_state(model, model_config, load_config)
+        prepare_model_state(model, model_config)
 
     monkeypatch.setattr(runtime, "_prepare_rfork_model_state", prepare_state)
 

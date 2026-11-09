@@ -200,6 +200,7 @@ Performance depends on model size, shard topology, NPU tensor layout, TransferEn
     - **Online weight transfer** (`weight_transfer_config` is set), because weights can be replaced after loading.
     - **Static expert placement** (`eplb_config.expert_map_path` is set), because the placement map is applied outside the transferred tensor set.
     - **Dynamic EPLB**, because expert weights and placement can change after the seed service starts. This covers `parallel_config.enable_eplb`, `eplb_config.dynamic_eplb`, and `eplb_config.expert_map_record_path`.
+    - **Qwen3, GLM, or Kimi K3 DSpark with QuaRot**, because the proposer rotates draft weights after seed registration. The target model can still use RFork.
 - Falling back to the default loader requires releasing the RFork seed service and registered memory first. RFork makes at most two cleanup attempts (`FALLBACK_CLEANUP_MAX_ATTEMPTS`, currently 2), with a short backoff before the second attempt, and only then reclaims memory and reruns the default loader. A pending legacy `/put_seed` for an unpublished receiver does not block native finalization, but if required local cleanup still fails, tensor owners remain pinned and RFork raises rather than allocating a second copy of the model; a session that already reached the finalized state raises as well. Both cases abort startup instead of degrading to a slow load.
 - The example [`rfork_planner.py`](https://github.com/vllm-project/vllm-ascend/blob/main/examples/rfork/rfork_planner.py) is only a simple mock implementation. If you need stronger scheduling, capacity management, or production-grade availability behavior, implement your own planner based on the RFork seed protocol.
 - The planner protocol headers `SEED_REFCNT` and `SEED_RANK` carry no scheduling meaning, but they are not optional on the wire today:
@@ -297,12 +298,12 @@ No. RFork intentionally reads exactly `numel * element_size` bytes for each tens
 
 ### What happens when MTP checkpoint metadata cannot be read?
 
-For MTP drafts using `AscendDeepSeekMTP`, RFork prepares checkpoint-dependent head ownership and module aliases before
-registering tensors. It reads the names in the selected safetensors headers using the default loader's source,
-revision, and file-selection rules. Uncached remote checkpoints may be downloaded during this preparation. If the
-metadata cannot be read, including checkpoints selected in PT/bin format, RFork uses the default loader and does
-not publish that model as a seed. This adaptation stays within the RFork loader and reuses the model's existing
-head-ownership helper; other draft implementations do not require this metadata step.
+For MTP drafts using `AscendDeepSeekMTP` and DeepSeek V4/V4.1, Qwen3, or GLM DSpark drafts, RFork prepares
+checkpoint-dependent model state before registering tensors. It reads weight names from a root-level
+`*.safetensors.index.json` file, including for remote model identifiers. If several indexes exist, it uses the first
+in filename order. Without an index, it reads safetensors headers from a local checkpoint directory. If the metadata
+cannot be read, including when a remote checkpoint has no discoverable index or a checkpoint uses PT/bin, RFork uses
+the default loader and does not publish that model as a seed.
 
 ### How do I configure TransferEngine ports?
 
