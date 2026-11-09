@@ -173,6 +173,8 @@ Lease release is asynchronous. An unresolved release delays advertising the rece
 
 Mainstream model families such as DeepSeek, Qwen, and GLM are supported.
 
+For speculative decoding, RFork restores checkpoint-dependent embedding and head ownership for DeepSeek V4/V4.1 DSpark drafts and head ownership for `AscendDeepSeekMTP`. Other drafts may retain their constructor defaults; compare acceptance rates with the default loader when qualifying them.
+
 ## Performance Considerations
 
 RFork indexes tensor address ranges to find backing allocations and uses binary search for memory-coverage checks during registration. Registration still adds seed startup cost, so RFork is most beneficial when later replicas reuse a seed rather than for a single cold start.
@@ -295,14 +297,14 @@ Tensor IDs are readable canonical paths such as `layers.0.self_attn.impl.scales[
 
 No. RFork intentionally reads exactly `numel * element_size` bytes for each tensor entry, including processed NZ, packed-weight, and derived-scale tensors. Allocation capacity, descriptor-only padding outside the tensor's dense logical range, and adjacent or shared storage are not part of that tensor's payload and are not copied implicitly. A future NPU format that requires bytes outside this range needs explicit manifest and transfer-protocol support. For dense transposes and reshapes, RFork transfers the one continuous byte range covered by a non-overlapping dense tensor and does not require a separate stride-equality check; gapped or overlapping layouts are rejected.
 
-### What happens when MTP checkpoint metadata cannot be read?
+### What happens when draft checkpoint metadata cannot be read?
 
-For MTP drafts using `AscendDeepSeekMTP`, RFork prepares checkpoint-dependent head ownership and module aliases before
-registering tensors. It reads the names in the selected safetensors headers using the default loader's source,
-revision, and file-selection rules. Uncached remote checkpoints may be downloaded during this preparation. If the
-metadata cannot be read, including checkpoints selected in PT/bin format, RFork uses the default loader and does
-not publish that model as a seed. This adaptation stays within the RFork loader and reuses the model's existing
-head-ownership helper; other draft implementations do not require this metadata step.
+For MTP drafts using `AscendDeepSeekMTP` and DeepSeek V4/V4.1 DSpark drafts, RFork prepares checkpoint-dependent
+state before registering tensors: head ownership and module aliases for `AscendDeepSeekMTP`, and embedding and head
+ownership for DSpark. It reads weight names using the default loader's source, revision, and file-selection rules.
+Uncached remote checkpoints may be downloaded during this preparation. If metadata cannot be read, including
+checkpoints selected in PT/bin format, RFork uses the default loader and does not publish that model as a seed.
+Other drafts may also derive ownership from checkpoint weights; compare acceptance rates with the default loader.
 
 ### How do I configure TransferEngine ports?
 

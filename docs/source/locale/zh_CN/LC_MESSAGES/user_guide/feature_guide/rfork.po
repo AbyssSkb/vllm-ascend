@@ -79,6 +79,9 @@ msgstr "## 支持的模型"
 msgid "Mainstream model families such as DeepSeek, Qwen, and GLM are supported."
 msgstr "支持 DeepSeek、Qwen、GLM 等主流系列模型。"
 
+msgid "For speculative decoding, RFork restores checkpoint-dependent embedding and head ownership for DeepSeek V4/V4.1 DSpark drafts and head ownership for `AscendDeepSeekMTP`. Other drafts may retain their constructor defaults; compare acceptance rates with the default loader when qualifying them."
+msgstr "对于推测解码，RFork 会为 DeepSeek V4/V4.1 DSpark draft 恢复依赖检查点的 embedding 和 head 所有权，并为 `AscendDeepSeekMTP` 恢复 head 所有权。其他 draft 可能保留构造时的默认值；验证时请与默认加载器比较接收率。"
+
 msgid "## Performance Considerations"
 msgstr "## 性能注意事项"
 
@@ -528,14 +531,8 @@ msgid ""
 "fix the initialization error and restart the worker."
 msgstr "如果启用 Engram CPU 卸载的模型构造在返回完整模型前失败，RFork 会停止，而不是通过默认加载器重试。无法通过模型安全释放部分构造的主机表；请修复初始化错误并重启 worker。"
 
-msgid ""
-"For MTP drafts using `AscendDeepSeekMTP`, RFork prepares checkpoint-dependent head ownership and module aliases before\n"
-"registering tensors. It reads the names in the selected safetensors headers using the default loader's source,\n"
-"revision, and file-selection rules. Uncached remote checkpoints may be downloaded during this preparation. If the\n"
-"metadata cannot be read, including checkpoints selected in PT/bin format, RFork uses the default loader and does\n"
-"not publish that model as a seed. This adaptation stays within the RFork loader and reuses the model's existing\n"
-"head-ownership helper; other draft implementations do not require this metadata step."
-msgstr "对于采用 `AscendDeepSeekMTP` 实现的 MTP draft，RFork 会在注册张量前准备依赖检查点的 head 所有权和模块别名。它会按照默认加载器的 source、revision 和文件选择规则，读取所选 safetensors 头部中的名称。准备过程中可能下载未缓存的远程检查点。如果无法读取元数据（包括以 PT/bin 格式选择的检查点），RFork 会使用默认加载器，并不会将该模型发布为 seed。此适配保留在 RFork 加载器内，并复用模型现有的 head 所有权辅助函数；其他 draft 实现不需要此元数据步骤。"
+msgid "For MTP drafts using `AscendDeepSeekMTP` and DeepSeek V4/V4.1 DSpark drafts, RFork prepares checkpoint-dependent state before registering tensors: head ownership and module aliases for `AscendDeepSeekMTP`, and embedding and head ownership for DSpark. It reads weight names using the default loader's source, revision, and file-selection rules. Uncached remote checkpoints may be downloaded during this preparation. If metadata cannot be read, including checkpoints selected in PT/bin format, RFork uses the default loader and does not publish that model as a seed. Other drafts may also derive ownership from checkpoint weights; compare acceptance rates with the default loader."
+msgstr "对于使用 `AscendDeepSeekMTP` 的 MTP draft 和 DeepSeek V4/V4.1 DSpark draft，RFork 在注册张量前准备依赖检查点的状态：前者准备 head 所有权和模块别名，后者准备 embedding 和 head 所有权。它按默认加载器的 source、revision 和文件选择规则读取权重名称；未缓存的远程检查点可能在此时被下载。如果无法读取元数据（包括选择了 PT/bin 格式），RFork 使用默认加载器，也不会将该模型发布为 seed。其他 draft 也可能根据检查点权重决定所有权；验证时请与默认加载器比较接收率。"
 
 msgid "Engram CPU offload and the shared-memory fallback limitation are covered in the [FAQ](#faq)."
 msgstr "Engram CPU 卸载和共享内存回退的限制请参阅 [FAQ](#faq)。"
@@ -616,7 +613,7 @@ msgstr "### RFork 会复制张量载荷之外的填充吗？"
 msgid "No. RFork intentionally reads exactly `numel * element_size` bytes for each tensor entry, including processed NZ, packed-weight, and derived-scale tensors. Allocation capacity, descriptor-only padding outside the tensor's dense logical range, and adjacent or shared storage are not part of that tensor's payload and are not copied implicitly. A future NPU format that requires bytes outside this range needs explicit manifest and transfer-protocol support. For dense transposes and reshapes, RFork transfers the one continuous byte range covered by a non-overlapping dense tensor and does not require a separate stride-equality check; gapped or overlapping layouts are rejected."
 msgstr "不会。RFork 有意为每个张量条目精确读取 `numel * element_size` 字节，包括处理后的 NZ、打包权重和派生 scale 张量。分配容量、张量稠密逻辑范围之外的仅描述符填充，以及相邻或共享存储，都不属于该张量的载荷，不会被隐式复制。未来若出现需要该范围之外字节的 NPU 格式，需要显式的 manifest 和传输协议支持。对于稠密转置与 reshape，RFork 传输非重叠稠密张量覆盖的一个连续字节范围，不要求单独的 stride 相等性检查；带间隙或重叠的布局仍会被拒绝。"
 
-msgid "### What happens when MTP checkpoint metadata cannot be read?"
+msgid "### What happens when draft checkpoint metadata cannot be read?"
 msgstr "### 无法读取 MTP 检查点元数据时会怎样？"
 
 msgid "### How do I configure TransferEngine ports?"

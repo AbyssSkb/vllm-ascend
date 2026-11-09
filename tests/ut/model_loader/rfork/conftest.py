@@ -256,3 +256,47 @@ def rfork_helpers(monkeypatch, local_weights):
         rope_dict=rope_dict,
         mtp_module=mtp_module,
     )
+
+
+@pytest.fixture
+def checkpoint_loader(monkeypatch, rfork_helpers):
+    @dataclass
+    class CheckpointSource:
+        model_or_path: str
+        revision: str | None
+        subfolder: str | None = None
+        prefix: str = ""
+        fall_back_to_pt: bool = True
+        allow_patterns_overrides: list[str] | None = None
+
+    calls = []
+    folders: dict[str, str] = {}
+    repo_files: dict[str, list[str]] = {}
+    selections: dict[str, tuple[list[str], bool]] = {}
+    configs = []
+
+    class DefaultModelLoader:
+        Source = CheckpointSource
+
+        def __init__(self, load_config):
+            configs.append(load_config)
+
+        def _prepare_weights(self, *args):
+            calls.append(args)
+            return folders.get(args[0], "unused"), *selections[args[0]]
+
+    _stub(monkeypatch, "vllm.model_executor.model_loader.default_loader", DefaultModelLoader=DefaultModelLoader)
+    _stub(monkeypatch, "transformers.utils", SAFE_WEIGHTS_INDEX_NAME="model.safetensors.index.json")
+    _stub(
+        monkeypatch,
+        "vllm.transformers_utils.repo_utils",
+        list_filtered_repo_files=lambda **kwargs: repo_files.get(kwargs["model_name_or_path"], []),
+    )
+    return SimpleNamespace(
+        Source=CheckpointSource,
+        calls=calls,
+        folders=folders,
+        repo_files=repo_files,
+        selections=selections,
+        configs=configs,
+    )
