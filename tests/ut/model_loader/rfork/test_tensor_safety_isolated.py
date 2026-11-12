@@ -482,3 +482,86 @@ def test_shared_reuse_requires_all_tensor_bytes_and_nonempty_state(tensor_runtim
     assert not backend.can_reuse_shared_weights(object(), False, [(address, size - 1)])
     monkeypatch.setattr(tensor_runtime.transfer_backend, "collect_transferable_tensors", lambda *args: [])
     assert not backend.can_reuse_shared_weights(object(), False, [(address, size)])
+
+
+class _FakeYrEngine:
+    def __init__(self, rpc_port=45678, initialize_error=False):
+        self.rpc_port = rpc_port
+        self.initialize_error = initialize_error
+        self.initialize_calls: list[tuple[str, str, str]] = []
+        self.finalize_calls = 0
+
+    def initialize(self, endpoint, protocol, device_name):
+        self.initialize_calls.append((endpoint, protocol, device_name))
+        return SimpleNamespace(
+            is_error=lambda: self.initialize_error,
+            to_string=lambda: "mock initialize error",
+        )
+
+    def get_rpc_port(self):
+        return self.rpc_port
+
+    def finalize(self):
+        self.finalize_calls += 1
+        return SimpleNamespace(is_error=lambda: False)
+
+
+def _install_yr_module_with_engine(monkeypatch, tensor_runtime, engine):
+    transfer_backend = tensor_runtime.transfer_backend
+    yr_module = ModuleType("yr")
+    datasystem_module = ModuleType("yr.datasystem")
+    datasystem_module.TransferEngine = lambda: engine  # type: ignore[attr-defined]
+    datasystem_module.MemoryRegistration = object  # type: ignore[attr-defined]
+    datasystem_module.ErrorCode = SimpleNamespace(kNotReady=1, kNotFound=2)  # type: ignore[attr-defined]
+    yr_module.datasystem = datasystem_module  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "yr", yr_module)
+    monkeypatch.setitem(sys.modules, "yr.datasystem", datasystem_module)
+    monkeypatch.setattr(transfer_backend, "get_ip", lambda: "10.0.0.1")
+    monkeypatch.setattr(
+        transfer_backend,
+        "torch",
+        SimpleNamespace(npu=SimpleNamespace(current_device=lambda: 2)),
+    )
+    return engine
+
+
+def test_initialize_transfer_engine_binds_dynamic_port_and_reads_rpc_port(tensor_runtime, monkeypatch):
+    engine = _install_yr_module_with_engine(monkeypatch, tensor_runtime, _FakeYrEngine(rpc_port=45678))
+    backend = tensor_runtime.RForkTransferBackend()
+
+    assert engine.initialize_calls == [("10.0.0.1:0", "ascend", "npu:2")]
+    assert backend.transfer_session_id == "10.0.0.1:45678"
+    assert backend.transfer_engine is engine
+    assert backend._is_initialized
+
+
+@pytest.mark.parametrize("rpc_port", [0, -1, 65536, None])
+def test_initialize_transfer_engine_rejects_invalid_rpc_port(tensor_runtime, monkeypatch, rpc_port):
+    engine = _install_yr_module_with_engine(monkeypatch, tensor_runtime, _FakeYrEngine(rpc_port=rpc_port))
+    with pytest.raises(RuntimeError, match="invalid RPC port"):
+        tensor_runtime.RForkTransferBackend()
+
+    assert engine.finalize_calls == 1
+
+
+def test_initialize_transfer_engine_requires_get_rpc_port(tensor_runtime, monkeypatch):
+    class _EngineWithoutRpcPort(_FakeYrEngine):
+        get_rpc_port = None  # type: ignore[assignment]
+
+    engine = _install_yr_module_with_engine(monkeypatch, tensor_runtime, _EngineWithoutRpcPort())
+    with pytest.raises(RuntimeError, match="get_rpc_port"):
+        tensor_runtime.RForkTransferBackend()
+
+    assert engine.finalize_calls == 1
+
+
+def test_initialize_transfer_engine_finalizes_engine_when_rpc_port_raises(tensor_runtime, monkeypatch):
+    class _EngineWithRaisingRpcPort(_FakeYrEngine):
+        def get_rpc_port(self):
+            raise RuntimeError("native rpc port query failed")
+
+    engine = _install_yr_module_with_engine(monkeypatch, tensor_runtime, _EngineWithRaisingRpcPort())
+    with pytest.raises(RuntimeError, match="native rpc port query failed"):
+        tensor_runtime.RForkTransferBackend()
+
+    assert engine.finalize_calls == 1
